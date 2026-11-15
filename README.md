@@ -7,7 +7,7 @@ Telegram 式的对话模型——会话、已读回执、离线补发、永久�
 lan-telegram 是「持续对话」的聊天。
 
 > 最新发布 **v0.2.0**（M1–M4 + Windows 双 exe）：存储、命令行、TLS 1.3 指纹固定、Liquid Glass 桌面界面、文件/图片传输。
-> 主线 **v0.3.0 开发中**：M5 群聊、搜索、发送进度条。成品见 [Releases](https://github.com/2778277877778/lan-telegram/releases)。
+> 主线 **v0.3.1 开发中**：液态玻璃透明度增强；M5 群聊、搜索、发送进度条在路上。成品见 [Releases](https://github.com/2778277877778/lan-telegram/releases)。
 
 ## 现在能做什么
 
