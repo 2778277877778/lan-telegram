@@ -2,6 +2,8 @@
 name = "lan-telegram-desktop"
 version = "0.3.1"
 edition = "2021"
+license = "GPL-3.0-only"
+description = "局域网聊天桌面客户端（Tauri + Liquid Glass）"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

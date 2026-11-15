@@ -218,3 +218,15 @@ python tests/m4_files_check.py  # M4 验收 13/13：文件图片/幂等/缩略�
 [lan-sync](https://github.com/2778277877778/lan-sync) 是「传完就走」的局域网互传工具（文本+文件+GUI+网页端，v1.1.4 稳定）。
 本项目源自它的传输骨架（HTTP 服务、密钥认证、打包链路），自 v0.1.0 起拆分为独立仓库、独立发版：
 端口不同（32200 / 32100），数据目录不同（`.lan-telegram` / `.marvis-lan-sync`），互不影响，可同时运行。
+
+## 许可证
+
+[GNU General Public License v3.0](LICENSE)（GPL-3.0-only）。
+
+你可以自由使用、修改、分发本软件；若分发修改后的版本，需以同一许可证开源。
+详细条款见 [LICENSE](LICENSE)。
+
+## 贡献
+
+欢迎 issue 与 PR。跑测试前请先读「测试与排障」一节（Windows 需 `$env:PYTHONUTF8="1"`）；
+提交前确保 `tests/` 下五个验收脚本全绿。
