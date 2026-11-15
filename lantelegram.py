@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""lan-telegram —— 局域网聊天（M2：TLS 1.3 加密 + 指纹固定）
+"""lan-telegram —— 局域网聊天（M3：桌面 GUI 就绪的服务端）
 
 设计文档见 docs/lan-telegram-design.md。
-M1 范围：两个实例互发文本、历史可分页、重启不丢、已读回执、离线重试。
-M2 范围：自签证书 + 证书指纹人工核对固定；启用 TLS 后两端仅允许 TLS 1.3，
-指纹不符（未固定 / 换证书）在握手层直接拒连；明文 HTTP 下行为与 M1 完全一致。
+M1：本地存储 + 点对点协议 + 命令行；M2：TLS 1.3 + 指纹固定。
+M3 新增：桌面/网页 GUI 所需端点（/api/v2/send、/conversations、/contacts、/read），
+投递/已读逻辑抽为 server_send / server_mark_read，与 CLI 完全同源（消除行为分叉）。
+明文 HTTP 下行为与 M1/M2 一致。
 
 用法：
     python lantelegram.py info
@@ -36,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SERVICE = "lan-telegram"
 DEFAULT_PORT = 32200
 CREATE_NO_WINDOW = 0x08000000
@@ -516,6 +517,122 @@ class Store:
             self.conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (k, str(v)))
             self.conn.commit()
 
+    def devices_public(self):
+        """设备表（无敏感字段，devices 不含密钥）。"""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT id,name,ip,port,last_seen FROM devices ORDER BY last_seen DESC").fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------- GUI 共享动作
+
+def env_row(store, mid):
+    """取一条消息的前端展示形状。"""
+    msg = store.get_message(mid)
+    if not msg:
+        return None
+    try:
+        body = json.loads(msg["body"] or "{}")
+    except Exception:
+        body = {}
+    return {"id": msg["id"], "conv": msg["conv"], "sender": msg["sender"],
+            "ts": msg["ts"], "kind": msg["kind"], "body": body,
+            "state": msg["state"], "direction": msg["direction"],
+            "reply_to": msg["reply_to"] or None, "read": msg["read"]}
+
+
+def server_send(store, cfg, ref, text, reply_to=None):
+    """服务端发送：与 cmd_send 同一链路（hello→建档→投递，失败入队补发）。
+
+    ref 可以是设备名 / 设备ID / IP / IP:端口；返回结构化结果供 CLI 与 GUI 共用。
+    """
+    if not text:
+        return {"ok": False, "error": "消息为空"}
+    # ref 可以是设备名 / 设备ID / IP / IP:端口：先拆可能的端口，再按整体与主机名查设备表
+    host, _, pstr = ref.rpartition(":")
+    ip_hint, port_hint = (host, int(pstr)) if host and pstr.isdigit() else (ref, None)
+    dev = store.find_device(ref) or store.find_device(ip_hint)
+    ip = (dev or {}).get("ip") or ip_hint
+    port = port_hint or int((dev or {}).get("port") or DEFAULT_PORT)
+    if not ip:
+        return {"ok": False, "error": f"未知目标 {ref}"}
+    tctx = tls_client_ctx(cfg)
+
+    def queue_offline(reason):
+        """对方不可达：聊过就入队，没聊过就报错（与 M1 CLI 语义一致）。"""
+        if dev and dev.get("id") != cfg["device_id"]:
+            conv = f"dm:{dev['id']}"
+            store.ensure_conv(conv, dev["id"], dev.get("name") or "")
+            env = {"id": uuid.uuid4().hex, "conv": conv, "from": cfg["device_id"],
+                   "from_name": cfg.get("device_name"), "from_port": cfg.get("port"),
+                   "ts": now_ms(), "kind": "text", "body": {"text": text},
+                   "reply_to": reply_to}
+            store.add_message(env, direction="out", state="queued")
+            store.enqueue(env["id"])
+            return {"ok": True, "queued": True,
+                    "device": dev.get("name") or dev["id"][:8],
+                    "message": env_row(store, env["id"]), "error": str(reason)}
+        return {"ok": False, "error": f"连不上 {ip}:{port} —— {reason}"}
+
+    try:
+        info = hello(ip, port, cfg["key"], cfg["device_id"], cfg.get("device_name"),
+                     cfg.get("port", DEFAULT_PORT), tls_ctx=tctx)
+    except RuntimeError as e:      # 密钥不符（401）
+        return {"ok": False, "auth": True, "error": str(e),
+                "key": cfg["key"]}
+    except Exception as e:
+        if isinstance(e, ssl.SSLError) and "certificate verify failed" in str(e):
+            return {"ok": False, "tls": True,
+                    "error": "对端证书与已固定指纹不符（TLS 握手拒绝）。"
+                             "若对方确已更换证书：trust --remove <旧指纹前缀> 后重新 trust 配对"}
+        return queue_offline(e)
+    if not info:
+        return queue_offline("对方无响应")
+    peer_id = info["device_id"]
+    if peer_id == cfg["device_id"]:
+        return {"ok": False, "error": "目标就是本机，换一个地址"}
+
+    conv = f"dm:{peer_id}"
+    name = info.get("device") or ""
+    store.upsert_device(peer_id, name, ip, port)
+    store.ensure_conv(conv, peer_id, name)
+    env = {"id": uuid.uuid4().hex, "conv": conv, "from": cfg["device_id"],
+           "from_name": cfg.get("device_name"), "from_port": cfg.get("port"),
+           "ts": now_ms(), "kind": "text", "body": {"text": text}, "reply_to": reply_to}
+    store.add_message(env, direction="out", state="queued")
+    try:
+        st, obj = post_message(ip, port, cfg["key"],
+                               {k: v for k, v in env.items() if k != "conv"},
+                               tls_ctx=tctx)
+    except Exception as e:
+        store.enqueue(env["id"])
+        return {"ok": True, "queued": True, "device": name or peer_id[:8],
+                "message": env_row(store, env["id"]), "error": str(e)}
+    if st == 200 and obj.get("ok"):
+        state = "delivered" if obj.get("delivered") else "sent"
+        store.set_state(env["id"], state)
+        return {"ok": True, "device": name or peer_id[:8], "peer_id": peer_id,
+                "ip": ip, "port": port, "state": state,
+                "message": env_row(store, env["id"])}
+    store.enqueue(env["id"])
+    return {"ok": True, "queued": True, "device": name or peer_id[:8],
+            "message": env_row(store, env["id"]), "error": f"HTTP {st}"}
+
+
+def server_mark_read(store, cfg, conv=None):
+    """看完即已读：回执给各发件人 + 本地标记（cmd_history 与 GUI 共用）。"""
+    tctx = tls_client_ctx(cfg)
+    acked = 0
+    for m in store.unread_inbound(conv):
+        peer = store.get_device(m["sender"])
+        if peer and peer.get("ip"):
+            send_ack(peer["ip"], int(peer.get("port") or DEFAULT_PORT),
+                     cfg["key"], m["id"], "read", tls_ctx=tctx)
+            acked += 1
+    store.mark_read(conv)
+    return {"acked": acked}
+
 
 # ---------------------------------------------------------------- 客户端
 
@@ -685,7 +802,27 @@ class Handler(BaseHTTPRequestHandler):
             before = query.get("before", [""])[0]
             items = self.server.store.messages(conv, limit=limit,
                                                before_ts=int(before) if before else None)
+            for it in items:
+                try:
+                    it["body"] = json.loads(it.get("body") or "{}")
+                except Exception:
+                    it["body"] = {}
             return self._json(200, {"ok": True, "items": items})
+
+        if route == "/api/v2/conversations":
+            out = []
+            for c in self.server.store.list_convs():
+                item = dict(c)
+                try:
+                    item["preview"] = (json.loads(c.get("last_body") or "{}").get("text") or "")[:60]
+                except Exception:
+                    item["preview"] = ""
+                item.pop("last_body", None)
+                out.append(item)
+            return self._json(200, {"ok": True, "conversations": out})
+
+        if route == "/api/v2/contacts":
+            return self._json(200, {"ok": True, "contacts": self.server.store.devices_public()})
 
         return self._json(404, {"ok": False, "error": "not found"})
 
@@ -694,6 +831,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if getattr(self.server, "local", False) and route in (
+                "/api/v2/hello", "/api/v2/messages", "/api/v2/ack"):
+            # 对等协议端点只属于面向局域网的主监听口
+            return self._json(404, {"ok": False, "error": "not found"})
         if not self._authed(query):
             return self._json(401, {"ok": False, "error": "密钥不匹配"})
         obj = self._body()
@@ -751,12 +892,25 @@ class Handler(BaseHTTPRequestHandler):
             store.add_event("receipt", {"message_id": mid, "state": state})
             return self._json(200, {"ok": True})
 
+        if route == "/api/v2/send":
+            text = (obj.get("text") or "").strip()
+            ref = (obj.get("to") or "").strip()
+            if not text or not ref:
+                return self._json(400, {"ok": False, "error": "缺少 text / to"})
+            res = server_send(store, cfg, ref, text, obj.get("reply_to"))
+            return self._json(200 if res.get("ok") else 400, res)
+
+        if route == "/api/v2/read":
+            res = server_mark_read(store, cfg, (obj.get("conv") or "").strip() or None)
+            return self._json(200, {"ok": True, **res})
+
         return self._json(404, {"ok": False, "error": "not found"})
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     tls = False
+    local = False   # 本机 GUI/网页接入口：只受理界面端点，拒绝对等协议
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -887,12 +1041,29 @@ def cmd_serve(args):
         cfg["port"] = port
         save_config(cfg)
 
+    # 本机 GUI/网页接入口：固定明文回环 127.0.0.1（默认主端口+1）。
+    # TLS 模式下主端口只认双向固定证书，桌面壳与浏览器一律走这个口；
+    # 对等协议端点（hello/messages/ack）在此口上不可用，局域网侧不受影响。
+    gui_port = port + 1
+    for _ in range(6):
+        try:
+            gui = Server(("127.0.0.1", gui_port), Handler)
+            break
+        except OSError:
+            gui_port += 1
+    else:
+        die("找不到可用的本机接入口（主端口+1 起被占用）")
+    gui.sync_key, gui.store, gui.cfg = cfg["key"], store, cfg
+    gui.tls, gui.local = False, True
+    threading.Thread(target=gui.serve_forever, daemon=True).start()
+
     stop_event = threading.Event()
     threading.Thread(target=outbox_worker, args=(store, cfg, stop_event), daemon=True).start()
-    write_state({"pid": os.getpid(), "port": port, "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    write_state({"pid": os.getpid(), "port": port, "local_port": gui_port,
+                 "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
 
     print(f"[lan-telegram] 已启动  {cfg['device_name']}  (设备 {cfg['device_id'][:8]})")
-    print(f"  端口: {port}   密钥: {cfg['key']}")
+    print(f"  端口: {port}   本机接口: 127.0.0.1:{gui_port}   密钥: {cfg['key']}")
     if tls:
         fp, _ = ensure_self_cert(cfg)
         print(f"  TLS:  1.3 强制 · 本机指纹 {fp_groups(fp)} · 已固定对端 {len(load_pins())} 个")
@@ -942,7 +1113,8 @@ def start_background():
     cfg = load_config()
     st = read_state()
     if st.get("pid") and is_running(st["pid"]):
-        return {"already": True, "port": st.get("port"), "pid": st["pid"]}
+        return {"already": True, "port": st.get("port"), "local_port": st.get("local_port"),
+                "pid": st["pid"]}
     if getattr(sys, "frozen", False):
         exe = sys.executable
         sib = Path(exe).with_name("lantelegram.exe")
@@ -964,8 +1136,8 @@ def start_background():
         time.sleep(0.15)
         st = read_state()
         if st.get("pid") and is_running(st["pid"]):
-            return {"already": False, "port": st.get("port"), "pid": st["pid"],
-                    "key": cfg["key"], "device_id": cfg["device_id"]}
+            return {"already": False, "port": st.get("port"), "local_port": st.get("local_port"),
+                    "pid": st["pid"], "key": cfg["key"], "device_id": cfg["device_id"]}
     return {"already": False, "port": None, "pid": proc.pid, "warning": "启动超时，见日志",
             "log": str(log)}
 
@@ -1005,72 +1177,22 @@ def parse_target(text):
 
 def cmd_send(args):
     cfg = load_config()
-    tctx = tls_client_ctx(cfg)
     text = (args.text or "").strip()
     if not text:
         die("请提供 --text")
-    ip, port = parse_target(args.target)
     store = Store(paths()["db"])
-    try:
-        info = hello(ip, port, cfg["key"], cfg["device_id"], cfg.get("device_name"),
-                     cfg.get("port", DEFAULT_PORT), tls_ctx=tctx)
-    except RuntimeError as e:
-        die(f"{e}\n  本机密钥: {cfg['key']}\n  让对方执行: pair --key {cfg['key']}")
-    except ssl.SSLError as e:
-        if "certificate verify failed" in str(e):
-            die(f"对端证书与已固定指纹不符（TLS 握手拒绝）。\n"
-                f"  若对方确已更换证书：trust --remove <旧指纹前缀> 后重新 trust 配对")
-        die(f"TLS 握手失败：{e}")
-    except Exception as e:
-        # 连不上：如果之前聊过，就按已知设备入队，等对方上线自动补发
-        known = store.find_device(ip)
-        if known and known.get("id") != cfg["device_id"]:
-            conv = f"dm:{known['id']}"
-            store.ensure_conv(conv, known["id"], known.get("name") or "")
-            env = {"id": uuid.uuid4().hex, "conv": conv, "from": cfg["device_id"],
-                   "ts": now_ms(), "kind": "text", "body": {"text": text}, "reply_to": None}
-            store.add_message(env, direction="out", state="queued")
-            store.enqueue(env["id"])
-            print(f"对方暂不可达（{e}），消息已入队；设备 {known.get('name') or known['id'][:8]}"
-                  f" 上线后自动补发")
+    res = server_send(store, cfg, args.target, text)
+    if res.get("ok"):
+        if res.get("queued"):
+            print(f"对方暂不可达（{res.get('error', '')}），消息已入队；"
+                  f"设备 {res.get('device', '?')} 上线后自动补发")
             return
-        die(f"连不上 {ip}:{port} —— {e}\n  请确认对方已 serve，且端口放行")
-    if not info:
-        die(f"连不上 {ip}:{port}，请确认对方已 serve，且端口放行")
-    if info.get("device_id") == cfg["device_id"]:
-        die("目标就是本机，换一个地址")
-
-    peer_id = info["device_id"]
-    conv = f"dm:{peer_id}"
-    store.upsert_device(peer_id, info.get("device") or "", ip, port)
-    store.ensure_conv(conv, peer_id, info.get("device") or "")
-
-    env = {"id": uuid.uuid4().hex, "conv": conv, "from": cfg["device_id"],
-           "ts": now_ms(), "kind": "text", "body": {"text": text}, "reply_to": None}
-    store.add_message(env, direction="out", state="queued")
-    try:
-        st, obj = post_message(ip, port, cfg["key"], {**env, "from_name": cfg.get("device_name"),
-                                                     "from_port": cfg.get("port")}, tls_ctx=tctx)
-    except ssl.SSLError as e:
-        store.enqueue(env["id"])
-        die(f"TLS 握手失败：{e}\n  若对方更换过证书，请重新 trust 配对")
-    except Exception as e:
-        store.enqueue(env["id"])
-        print(f"对方暂不可达（{e}），消息已入队，等对方上线自动补发")
+        m = res["message"]
+        print(f"已发送给 {res['device']} ({res['ip']}:{res['port']}) · {fmt_ts(m['ts'])}")
         return
-
-    if st == 200 and obj.get("ok"):
-        store.set_state(env["id"], "delivered" if obj.get("delivered") else "sent")
-        print(f"已发送给 {info.get('device') or peer_id[:8]} ({ip}:{port}) · {fmt_ts(env['ts'])}")
-    elif st == 401:
-        store.enqueue(env["id"])
-        die(f"密钥不匹配（401）。\n  本机密钥: {cfg['key']}")
-    elif st == 403:
-        store.enqueue(env["id"])
-        die(f"证书与声明设备不符（403）：{obj.get('error', '')}")
-    else:
-        store.enqueue(env["id"])
-        print(f"发送失败（HTTP {st}），已入队重试")
+    if res.get("auth"):
+        die(f"{res['error']}\n  本机密钥: {res['key']}\n  让对方执行: pair --key {res['key']}")
+    die(res.get("error") or "发送失败")
 
 
 def cmd_history(args):
@@ -1115,14 +1237,8 @@ def cmd_history(args):
         state = {"queued": "待发", "sent": "已发", "delivered": "已送达", "read": "已读"}.get(m["state"], m["state"])
         print(f"[{fmt_ts(m['ts'])}] {who}: {text}" + (f"   ({state})" if m["direction"] == "out" else ""))
 
-    # 看完即已读：本地标记 + 回执给对端
-    tctx = tls_client_ctx(cfg)
-    for m in store.unread_inbound(conv):
-        peer = store.get_device(m["sender"])
-        if peer and peer.get("ip"):
-            send_ack(peer["ip"], int(peer.get("port") or DEFAULT_PORT), cfg["key"], m["id"], "read",
-                     tls_ctx=tctx)
-    store.mark_read(conv)
+    # 看完即已读：本地标记 + 回执给对端（与 GUI 共用同一路径）
+    server_mark_read(store, cfg, conv)
 
 
 def cmd_contacts(args):

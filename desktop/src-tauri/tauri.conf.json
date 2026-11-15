@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "lan-telegram",
+  "version": "0.2.0",
+  "identifier": "dev.myself.lan-tg.desktop",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "lan-telegram",
+        "width": 960,
+        "height": 640,
+        "minWidth": 640,
+        "minHeight": 420,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

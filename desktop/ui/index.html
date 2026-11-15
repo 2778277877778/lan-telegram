@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <title>lan-telegram</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <header class="side-head">
+        <div id="me">
+          <div class="me-avatar">我</div>
+          <div class="me-text">
+            <div id="me-name">…</div>
+            <div id="me-state">连接中</div>
+          </div>
+        </div>
+        <button id="theme-toggle" title="切换明暗" aria-label="切换明暗">◐</button>
+      </header>
+      <button id="new-chat" class="side-new">＋ 新对话</button>
+      <ul id="convs" aria-label="会话列表"></ul>
+      <footer class="side-foot">lan-telegram v0.2.0 · M3</footer>
+    </aside>
+
+    <main id="main">
+      <div id="empty">
+        <p>选择左侧会话，或点「新对话」</p>
+        <p class="hint">消息点对点直连，永不出局域网</p>
+      </div>
+      <section id="chat" hidden>
+        <header id="chat-head">
+          <div class="peer-avatar" id="peer-avatar">?</div>
+          <div class="peer-text">
+            <div id="peer-name">…</div>
+            <div id="peer-sub">离线</div>
+          </div>
+        </header>
+        <div id="msgs"></div>
+        <div id="reply-bar" hidden>
+          <span>回复：</span><span id="reply-text"></span>
+          <button id="reply-cancel" aria-label="取消回复">✕</button>
+        </div>
+        <footer id="composer">
+          <textarea id="input" rows="1" placeholder="输入消息…" autocomplete="off"></textarea>
+          <button id="send" title="发送 (Enter)">➤</button>
+        </footer>
+      </section>
+    </main>
+  </div>
+  <div id="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
