@@ -11,8 +11,8 @@ M3 新增：桌面/网页 GUI 所需端点（/api/v2/send、/conversations、/co
 用法：
     python lantelegram.py info
     python lantelegram.py serve --background
-    python lantelegram.py send --target 10.10.156.243 --text "在吗"
-    python lantelegram.py history --with 10.10.156.243
+    python lantelegram.py send --target 192.168.1.7 --text "在吗"
+    python lantelegram.py history --with 192.168.1.7
     python lantelegram.py cert                      # 本机证书指纹（给对方核对）
     python lantelegram.py trust --target <IP:端口> --expect <指纹前缀>   # 固定对端
     python lantelegram.py tls on                    # 两端配对完成后启用 TLS 1.3
