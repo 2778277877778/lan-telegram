@@ -2,12 +2,15 @@
 
 **局域网聊天工具：没有服务器中转、没有账号、没有互联网依赖。TLS 1.3 加密 + 证书指纹人工核对固定，消息只存在于两台机器上。**
 
-Telegram 式的对话模型——会话、已读回执、离线补发、永久本地历史——用纯 Python 实现。
+Telegram 式的对话模型——会话、已读回执、离线补发、永久本地历史——桌面端用 Rust + WebView2，
+协议引擎用纯 Python 标准库实现。
+
+![lan-telegram 桌面界面](docs/screenshot.png)
 它与 [lan-sync](https://github.com/2778277877778/lan-sync) 互传工具是两个独立应用：lan-sync 是「传完就走」的一次性收发，
 lan-telegram 是「持续对话」的聊天。
 
-> 最新发布 **v0.2.0**（M1–M4 + Windows 双 exe）：存储、命令行、TLS 1.3 指纹固定、Liquid Glass 桌面界面、文件/图片传输。
-> 主线 **v0.3.1 开发中**：液态玻璃透明度增强；M5 群聊、搜索、发送进度条在路上。成品见 [Releases](https://github.com/2778277877778/lan-telegram/releases)。
+> 最新发布 **v0.3.1**（Liquid Glass 界面增强）：存储、命令行、TLS 1.3 指纹固定、桌面客户端、文件/图片传输全部可用。
+> Windows 免安装成品见 [Releases](https://github.com/2778277877778/lan-telegram/releases)；下一里程碑 M5 群聊/搜索/发送进度。
 
 ## 现在能做什么
 
