@@ -514,7 +514,7 @@ async function boot() {
       $("me-name").textContent = S.me.name;
       $("me-state").textContent = st.tls ? "TLS 1.3 · 已加密" : "明文模式（建议 tls on）";
       $("me-state").className = st.tls ? "on" : "";
-      $("foot-state").textContent = `v0.2.0 · ${st.tls ? "TLS 1.3" : "明文"} · 端口 ${st.local_port ?? "?"}`;
+      $("foot-state").textContent = `v${(st.ping && st.ping.version) || "?"} · ${st.tls ? "TLS 1.3" : "明文"} · 端口 ${st.local_port ?? "?"}`;
     }
   } catch (e) { connected = false; }
   if (!connected) {

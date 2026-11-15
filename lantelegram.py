@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SERVICE = "lan-telegram"
 DEFAULT_PORT = 32200
 CREATE_NO_WINDOW = 0x08000000
