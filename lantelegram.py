@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""lan-telegram —— 局域网聊天（M2：TLS 1.3 加密 + 指纹固定）
+"""lan-telegram —— 局域网聊天（M3：桌面 GUI 就绪的服务端）
 
 设计文档见 docs/lan-telegram-design.md。
-M1 范围：两个实例互发文本、历史可分页、重启不丢、已读回执、离线重试。
-M2 范围：自签证书 + 证书指纹人工核对固定；启用 TLS 后两端仅允许 TLS 1.3，
-指纹不符（未固定 / 换证书）在握手层直接拒连；明文 HTTP 下行为与 M1 完全一致。
+M1：本地存储 + 点对点协议 + 命令行；M2：TLS 1.3 + 指纹固定。
+M3 新增：桌面/网页 GUI 所需端点（/api/v2/send、/conversations、/contacts、/read），
+投递/已读逻辑抽为 server_send / server_mark_read，与 CLI 完全同源（消除行为分叉）。
+明文 HTTP 下行为与 M1/M2 一致。
 
 用法：
     python lantelegram.py info
@@ -18,9 +19,12 @@ M2 范围：自签证书 + 证书指纹人工核对固定；启用 TLS 后两端
 """
 
 import argparse
+import base64
 import hashlib
+import hmac
 import http.client
 import json
+import mimetypes
 import os
 import secrets
 import socket
@@ -36,10 +40,13 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SERVICE = "lan-telegram"
 DEFAULT_PORT = 32200
 CREATE_NO_WINDOW = 0x08000000
+IMAGE_EXT = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
+UPLOAD_MAX = 500 * 1024 * 1024      # 单文件上限 500 MB
+THUMB_MAX = 2 * 1024 * 1024         # 缩略图上限 2 MB
 
 # ---------------------------------------------------------------- 路径与配置
 
@@ -62,7 +69,14 @@ def paths() -> dict:
         "self_key": h / "certs" / "key.pem",
         "pins": h / "certs" / "pins",
         "pins_meta": h / "certs" / "pins.json",
+        "attachments": h / "attachments",
     }
+
+
+def attach_dir() -> Path:
+    d = paths()["attachments"]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def load_config() -> dict:
@@ -516,6 +530,172 @@ class Store:
             self.conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (k, str(v)))
             self.conn.commit()
 
+    def devices_public(self):
+        """设备表（无敏感字段，devices 不含密钥）。"""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT id,name,ip,port,last_seen FROM devices ORDER BY last_seen DESC").fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------- GUI 共享动作
+
+def env_row(store, mid):
+    """取一条消息的前端展示形状。"""
+    msg = store.get_message(mid)
+    if not msg:
+        return None
+    try:
+        body = json.loads(msg["body"] or "{}")
+    except Exception:
+        body = {}
+    return {"id": msg["id"], "conv": msg["conv"], "sender": msg["sender"],
+            "ts": msg["ts"], "kind": msg["kind"], "body": body,
+            "state": msg["state"], "direction": msg["direction"],
+            "reply_to": msg["reply_to"] or None, "read": msg["read"]}
+
+
+def server_send(store, cfg, ref, text=None, reply_to=None, path=None, thumb_b64=None):
+    """服务端发送：文本或文件/图片（hello→建档→投递，失败入队补发）。
+
+    ref 可以是设备名 / 设备ID / IP / IP:端口；返回结构化结果供 CLI 与 GUI 共用。
+    path 给出时走附件链路：先拷贝进本机 attachments（补发可重传），kind 按扩展名。
+    """
+    # ref 可以是设备名 / 设备ID / IP / IP:端口：先拆可能的端口，再按整体与主机名查设备表
+    host, _, pstr = ref.rpartition(":")
+    ip_hint, port_hint = (host, int(pstr)) if host and pstr.isdigit() else (ref, None)
+    dev = store.find_device(ref) or store.find_device(ip_hint)
+    ip = (dev or {}).get("ip") or ip_hint
+    port = port_hint or int((dev or {}).get("port") or DEFAULT_PORT)
+    if not ip:
+        return {"ok": False, "error": f"未知目标 {ref}"}
+    tctx = tls_client_ctx(cfg)
+
+    # ---- 组装消息（文本 / 附件）
+    if path:
+        fp = Path(str(path).strip()).expanduser()
+        if not fp.is_file():
+            return {"ok": False, "error": f"文件不存在: {fp}"}
+        size = fp.stat().st_size
+        if size <= 0:
+            return {"ok": False, "error": "空文件不发送"}
+        if size > UPLOAD_MAX:
+            return {"ok": False, "error": f"文件超过 {UPLOAD_MAX // 1048576} MB 上限"}
+        ext = fp.suffix.lower().lstrip(".")
+        kind = "image" if ext in IMAGE_EXT else "file"
+        body = {"name": fp.name, "size": size}
+    elif text:
+        text = text.strip()
+        kind, body = "text", {"text": text}
+        if not text:
+            return {"ok": False, "error": "消息为空"}
+    else:
+        return {"ok": False, "error": "缺少 text 或 path"}
+
+    mid = uuid.uuid4().hex
+    env = {"id": mid, "from": cfg["device_id"], "from_name": cfg.get("device_name"),
+           "from_port": cfg.get("port"), "ts": now_ms(), "kind": kind, "body": body,
+           "reply_to": reply_to}
+
+    def queue_offline(reason, conv=None, peer_name=None):
+        """对方不可达：聊过/已知目标就入队，否则报错（与 M1 CLI 语义一致）。"""
+        cid = conv or (f"dm:{dev['id']}" if dev and dev.get("id") != cfg["device_id"] else "")
+        nm = peer_name or ((dev.get("name") or dev["id"][:8]) if dev else "?")
+        if cid:
+            e = dict(env, conv=cid)
+            store.ensure_conv(cid, cid[3:], dev.get("name") if dev else "")
+            store.add_message(e, direction="out", state="queued")
+            if path:
+                _store_attach(mid, Path(str(path)), thumb_b64)
+            store.enqueue(mid)
+            return {"ok": True, "queued": True, "device": nm,
+                    "message": env_row(store, mid), "error": str(reason)}
+        return {"ok": False, "error": f"连不上 {ip}:{port} —— {reason}"}
+
+    try:
+        info = hello(ip, port, cfg["key"], cfg["device_id"], cfg.get("device_name"),
+                     cfg.get("port", DEFAULT_PORT), tls_ctx=tctx)
+    except RuntimeError as e:      # 密钥不符（401）
+        return {"ok": False, "auth": True, "error": str(e),
+                "key": cfg["key"]}
+    except Exception as e:
+        if isinstance(e, ssl.SSLError) and "certificate verify failed" in str(e):
+            return {"ok": False, "tls": True,
+                    "error": "对端证书与已固定指纹不符（TLS 握手拒绝）。"
+                             "若对方确已更换证书：trust --remove <旧指纹前缀> 后重新 trust 配对"}
+        return queue_offline(e)
+    if not info:
+        return queue_offline("对方无响应")
+    peer_id = info["device_id"]
+    if peer_id == cfg["device_id"]:
+        return {"ok": False, "error": "目标就是本机，换一个地址"}
+
+    conv = f"dm:{peer_id}"
+    name = info.get("device") or ""
+    store.upsert_device(peer_id, name, ip, port)
+    store.ensure_conv(conv, peer_id, name)
+    e = dict(env, conv=conv)
+    store.add_message(e, direction="out", state="queued")
+    if path:
+        _store_attach(mid, Path(str(path)), thumb_b64)
+    try:
+        if path:
+            st, obj = upload_file(ip, port, cfg["key"],
+                                  dict(env, name=body["name"]),
+                                  Path(str(path)),
+                                  attach_dir() / (mid + ".thumb"), tls_ctx=tctx)
+        else:
+            st, obj = post_message(ip, port, cfg["key"],
+                                   {k: v for k, v in e.items() if k != "conv"},
+                                   tls_ctx=tctx)
+    except Exception as ex:
+        store.enqueue(mid)
+        return {"ok": True, "queued": True, "device": name or peer_id[:8],
+                "message": env_row(store, mid), "error": str(ex)}
+    if st == 200 and obj.get("ok"):
+        state = "delivered" if obj.get("delivered") else "sent"
+        store.set_state(mid, state)
+        store.dequeue(mid)
+        return {"ok": True, "device": name or peer_id[:8], "peer_id": peer_id,
+                "ip": ip, "port": port, "state": state,
+                "message": env_row(store, mid)}
+    store.enqueue(mid)
+    return {"ok": True, "queued": True, "device": name or peer_id[:8],
+            "message": env_row(store, mid), "error": f"HTTP {st}"}
+
+
+def _store_attach(mid, src, thumb_b64=None):
+    """把待发附件与缩略图拷进本机 attachments，供离线补发重传。"""
+    d = attach_dir()
+    dst = d / mid
+    try:
+        if not dst.exists():
+            import shutil as _sh
+            _sh.copyfile(str(src), str(dst))
+    except Exception:
+        pass
+    if thumb_b64 and not (d / (mid + ".thumb")).exists():
+        try:
+            tb = base64.b64decode(thumb_b64)
+            if 0 < len(tb) <= THUMB_MAX:
+                (d / (mid + ".thumb")).write_bytes(tb)
+        except Exception:
+            pass
+
+
+def server_mark_read(store, cfg, conv=None):
+    """看完即已读：回执给各发件人 + 本地标记（cmd_history 与 GUI 共用）。"""
+    tctx = tls_client_ctx(cfg)
+    acked = 0
+    for m in store.unread_inbound(conv):
+        peer = store.get_device(m["sender"])
+        if peer and peer.get("ip"):
+            send_ack(peer["ip"], int(peer.get("port") or DEFAULT_PORT),
+                     cfg["key"], m["id"], "read", tls_ctx=tctx)
+            acked += 1
+    store.mark_read(conv)
+    return {"acked": acked}
+
 
 # ---------------------------------------------------------------- 客户端
 
@@ -569,6 +749,59 @@ def send_ack(ip, port, key, mid, state="read", tls_ctx=None):
         pass
 
 
+def upload_file(ip, port, key, meta, file_path, thumb_path=None, tls_ctx=None):
+    """把本地文件作为消息体上传给对端（M4：文件/图片）。
+
+    meta 含 id/kind/ts/from/from_name/from_port/name；缩略图（若有）走 X-Thumb 头。
+    返回 (status, obj)。失败抛异常。
+    """
+    conn_cls = http.client.HTTPSConnection if tls_ctx is not None else http.client.HTTPConnection
+    if tls_ctx is not None:
+        conn = conn_cls(ip, int(port), timeout=60, context=tls_ctx)
+    else:
+        conn = conn_cls(ip, int(port), timeout=60)
+    size = os.path.getsize(str(file_path))
+    headers = {
+        "X-Sync-Key": key,
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(size),
+        "X-Msg-Id": meta["id"],
+        "X-Kind": meta["kind"],
+        "X-Ts": str(meta["ts"]),
+        "X-From": meta["from"],
+        "X-From-Name": urllib.parse.quote(str(meta.get("from_name") or "")),
+        "X-From-Port": str(meta.get("from_port") or DEFAULT_PORT),
+        "X-Name": urllib.parse.quote(meta["name"]),
+        "X-Size": str(size),
+    }
+    if thumb_path and os.path.exists(str(thumb_path)):
+        headers["X-Thumb"] = base64.urlsafe_b64encode(
+            Path(str(thumb_path)).read_bytes()).decode("ascii")
+    try:
+        with open(str(file_path), "rb") as f:
+            conn.putrequest("POST", "/api/v2/upload", skip_host=True, skip_accept_encoding=True)
+            headers["Host"] = f"{ip}:{port}"
+            for k, v in headers.items():
+                conn.putheader(k, v)
+            conn.endheaders()
+            left = size
+            while left > 0:
+                chunk = f.read(min(1 << 20, left))
+                if not chunk:
+                    break
+                conn.send(chunk)
+                left -= len(chunk)
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "ignore")
+        try:
+            obj = json.loads(raw or "{}")
+        except Exception:
+            obj = {"raw": raw}
+        return resp.status, obj
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- 服务端
 
 
@@ -594,9 +827,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _blob(self, code, data, ctype, fname=""):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        if fname:
+            self.send_header("Content-Disposition",
+                             "attachment; filename*=UTF-8''" + urllib.parse.quote(fname))
+        self.end_headers()
+        if data:
+            self.wfile.write(data)
+
     def _authed(self, query):
         key = self.headers.get("X-Sync-Key") or query.get("key", [""])[0]
-        return bool(key) and key == self.server.sync_key
+        return bool(key) and hmac.compare_digest(key.encode(), self.server.sync_key.encode())
 
     def _body(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -685,7 +929,52 @@ class Handler(BaseHTTPRequestHandler):
             before = query.get("before", [""])[0]
             items = self.server.store.messages(conv, limit=limit,
                                                before_ts=int(before) if before else None)
+            for it in items:
+                try:
+                    it["body"] = json.loads(it.get("body") or "{}")
+                except Exception:
+                    it["body"] = {}
             return self._json(200, {"ok": True, "items": items})
+
+        if route == "/api/v2/file":
+            # GUI 取缩略图/原件（本机与对端两个入口都可用，过密钥校验）。
+            # 只有消息表里认识这条 id 才放行，防任意路径读取。
+            mid = (query.get("msg", [""])[0]).strip()
+            thumb_q = (query.get("thumb", ["0"])[0]) == "1"
+            msg = self.server.store.get_message(mid) if mid else None
+            if not msg or msg.get("kind") not in ("file", "image"):
+                return self._json(404, {"ok": False, "error": "未知文件消息"})
+            base = attach_dir() / mid
+            target = Path(str(base) + ".thumb") if thumb_q else base
+            if not target.exists():
+                return self._json(404, {"ok": False, "error": "附件不存在"})
+            try:
+                data = target.read_bytes()
+            except Exception as e:
+                return self._json(500, {"ok": False, "error": f"读取失败 {e}"})
+            try:
+                body = json.loads(msg.get("body") or "{}")
+            except Exception:
+                body = {}
+            if thumb_q:
+                return self._blob(200, data, "image/png")
+            ctype = mimetypes.guess_type(body.get("name") or "")[0] or "application/octet-stream"
+            return self._blob(200, data, ctype, body.get("name") or mid)
+
+        if route == "/api/v2/conversations":
+            out = []
+            for c in self.server.store.list_convs():
+                item = dict(c)
+                try:
+                    item["preview"] = (json.loads(c.get("last_body") or "{}").get("text") or "")[:60]
+                except Exception:
+                    item["preview"] = ""
+                item.pop("last_body", None)
+                out.append(item)
+            return self._json(200, {"ok": True, "conversations": out})
+
+        if route == "/api/v2/contacts":
+            return self._json(200, {"ok": True, "contacts": self.server.store.devices_public()})
 
         return self._json(404, {"ok": False, "error": "not found"})
 
@@ -694,11 +983,18 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if getattr(self.server, "local", False) and route in (
+                "/api/v2/hello", "/api/v2/messages", "/api/v2/ack", "/api/v2/upload"):
+            # 对等协议端点只属于面向局域网的主监听口
+            return self._json(404, {"ok": False, "error": "not found"})
         if not self._authed(query):
             return self._json(401, {"ok": False, "error": "密钥不匹配"})
-        obj = self._body()
-        if obj is None:
-            return self._json(400, {"ok": False, "error": "bad json"})
+        # /upload 正文是原始字节，自行从 rfile 流式读取；其余 POST 一律 JSON
+        obj = None
+        if route != "/api/v2/upload":
+            obj = self._body()
+            if obj is None:
+                return self._json(400, {"ok": False, "error": "bad json"})
         store = self.server.store
         cfg = self.server.cfg
 
@@ -741,6 +1037,81 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "id": mid, "duplicate": not is_new,
                                     "delivered": True})
 
+        if route == "/api/v2/upload":
+            mid = (self.headers.get("X-Msg-Id") or "").strip()
+            sender = (self.headers.get("X-From") or "").strip()
+            kind = (self.headers.get("X-Kind") or "file").strip()
+            try:
+                size = int(self.headers.get("X-Size") or "0")
+                ts = int(self.headers.get("X-Ts") or str(now_ms()))
+            except ValueError:
+                return self._json(400, {"ok": False, "error": "坏头部"})
+            if not mid or not sender or len(mid) > 64 or kind not in ("file", "image") or size <= 0:
+                return self._json(400, {"ok": False, "error": "缺少/非法上传头部"})
+            if size > UPLOAD_MAX:
+                return self._json(413, {"ok": False, "error": f"文件超过 {UPLOAD_MAX // 1048576} MB 上限"})
+            if self.server.tls:
+                bound = self.cn_device()
+                if not bound:
+                    return self._json(403, {"ok": False, "error": "TLS 模式缺少已验证对端证书"})
+                if sender != bound:
+                    return self._json(403, {"ok": False, "error": "证书与声明设备不符"})
+            name = urllib.parse.unquote(self.headers.get("X-Name") or "file.bin")
+            fname = urllib.parse.unquote(self.headers.get("X-From-Name") or "")
+            if self.server.store.get_message(mid):
+                # 重复投递也要读完正文，保持 keep-alive 连接干净
+                remaining = int(self.headers.get("Content-Length") or "0")
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                return self._json(200, {"ok": True, "id": mid, "duplicate": True,
+                                        "delivered": True})
+            # 流式落盘（不整读进内存）：先写 .part 再原子改名
+            d = attach_dir()
+            part = d / (mid + ".part")
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+                if length <= 0 or length > UPLOAD_MAX:
+                    return self._json(411, {"ok": False, "error": "需要准确 Content-Length（≤上限）"})
+                remaining, wrote = length, 0
+                with open(part, "wb") as f:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(1 << 20, remaining))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                        wrote += len(chunk)
+                if remaining or wrote != size:
+                    part.unlink(missing_ok=True)
+                    return self._json(400, {"ok": False, "error": "正文不完整"})
+                part.replace(d / mid)
+                thumb = self.headers.get("X-Thumb")
+                if thumb:
+                    try:
+                        tb = base64.urlsafe_b64decode(thumb.encode("ascii", "ignore"))
+                        if 0 < len(tb) <= THUMB_MAX:
+                            (d / (mid + ".thumb")).write_bytes(tb)
+                    except Exception:
+                        pass
+            except Exception as e:
+                part.unlink(missing_ok=True)
+                return self._json(500, {"ok": False, "error": f"落盘失败 {e}"})
+            conv = f"dm:{sender}"
+            env = {"id": mid, "conv": conv, "from": sender, "from_name": fname,
+                   "ts": ts, "kind": kind, "body": {"name": name, "size": size},
+                   "reply_to": None}
+            store.upsert_device(sender, fname, self.client_address[0],
+                                int(self.headers.get("X-From-Port") or DEFAULT_PORT))
+            store.ensure_conv(conv, sender, fname)
+            is_new = store.add_message(env, direction="in", state="delivered")
+            if is_new:
+                store.add_event("message", env)
+            return self._json(200, {"ok": True, "id": mid, "duplicate": not is_new,
+                                    "delivered": True})
+
         if route == "/api/v2/ack":
             mid = (obj.get("message_id") or "").strip()
             state = (obj.get("state") or "read").strip()
@@ -751,12 +1122,27 @@ class Handler(BaseHTTPRequestHandler):
             store.add_event("receipt", {"message_id": mid, "state": state})
             return self._json(200, {"ok": True})
 
+        if route == "/api/v2/send":
+            ref = (obj.get("to") or "").strip()
+            text = (obj.get("text") or "").strip() or None
+            path = (obj.get("path") or "").strip() or None
+            if not ref or (not text and not path):
+                return self._json(400, {"ok": False, "error": "缺少 to 与 text/path"})
+            res = server_send(store, cfg, ref, text, obj.get("reply_to"),
+                              path, obj.get("thumb_b64"))
+            return self._json(200 if res.get("ok") else 400, res)
+
+        if route == "/api/v2/read":
+            res = server_mark_read(store, cfg, (obj.get("conv") or "").strip() or None)
+            return self._json(200, {"ok": True, **res})
+
         return self._json(404, {"ok": False, "error": "not found"})
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     tls = False
+    local = False   # 本机 GUI/网页接入口：只受理界面端点，拒绝对等协议
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -770,10 +1156,37 @@ class Server(ThreadingHTTPServer):
 
 
 def deliver_now(store, cfg, mid, ip, port):
-    """立即投递一条待发消息，成功返回 True。"""
+    """立即投递一条待发消息，成功返回 True。附件消息走 upload 重传。"""
     msg = store.get_message(mid)
     if not msg:
         return True
+    kind = msg["kind"]
+    if kind in ("file", "image"):
+        d = attach_dir()
+        src = d / mid
+        if not src.exists():
+            store.set_state(mid, "failed")
+            store.dequeue(mid)
+            store.add_event("state", {"message_id": mid, "state": "failed",
+                                      "reason": "本机附件已不存在"})
+            return True
+        try:
+            body = json.loads(msg["body"] or "{}")
+        except Exception:
+            body = {}
+        env = {"id": mid, "from": cfg["device_id"], "from_name": cfg.get("device_name"),
+               "from_port": cfg.get("port"), "ts": msg["ts"], "kind": kind,
+               "name": body.get("name") or mid}
+        try:
+            st, obj = upload_file(ip, port, cfg["key"], env, src,
+                                  d / (mid + ".thumb"), tls_ctx=tls_client_ctx(cfg))
+        except Exception:
+            return False
+        if st == 200 and obj.get("ok"):
+            store.set_state(mid, "delivered" if obj.get("delivered") else "sent")
+            store.dequeue(mid)
+            return True
+        return False
     env = {
         "id": msg["id"], "from": cfg["device_id"], "from_name": cfg.get("device_name"),
         "from_port": cfg.get("port"), "ts": msg["ts"], "kind": msg["kind"],
@@ -887,12 +1300,29 @@ def cmd_serve(args):
         cfg["port"] = port
         save_config(cfg)
 
+    # 本机 GUI/网页接入口：固定明文回环 127.0.0.1（默认主端口+1）。
+    # TLS 模式下主端口只认双向固定证书，桌面壳与浏览器一律走这个口；
+    # 对等协议端点（hello/messages/ack）在此口上不可用，局域网侧不受影响。
+    gui_port = port + 1
+    for _ in range(6):
+        try:
+            gui = Server(("127.0.0.1", gui_port), Handler)
+            break
+        except OSError:
+            gui_port += 1
+    else:
+        die("找不到可用的本机接入口（主端口+1 起被占用）")
+    gui.sync_key, gui.store, gui.cfg = cfg["key"], store, cfg
+    gui.tls, gui.local = False, True
+    threading.Thread(target=gui.serve_forever, daemon=True).start()
+
     stop_event = threading.Event()
     threading.Thread(target=outbox_worker, args=(store, cfg, stop_event), daemon=True).start()
-    write_state({"pid": os.getpid(), "port": port, "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    write_state({"pid": os.getpid(), "port": port, "local_port": gui_port,
+                 "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
 
     print(f"[lan-telegram] 已启动  {cfg['device_name']}  (设备 {cfg['device_id'][:8]})")
-    print(f"  端口: {port}   密钥: {cfg['key']}")
+    print(f"  端口: {port}   本机接口: 127.0.0.1:{gui_port}   密钥: {cfg['key']}")
     if tls:
         fp, _ = ensure_self_cert(cfg)
         print(f"  TLS:  1.3 强制 · 本机指纹 {fp_groups(fp)} · 已固定对端 {len(load_pins())} 个")
@@ -942,7 +1372,8 @@ def start_background():
     cfg = load_config()
     st = read_state()
     if st.get("pid") and is_running(st["pid"]):
-        return {"already": True, "port": st.get("port"), "pid": st["pid"]}
+        return {"already": True, "port": st.get("port"), "local_port": st.get("local_port"),
+                "pid": st["pid"]}
     if getattr(sys, "frozen", False):
         exe = sys.executable
         sib = Path(exe).with_name("lantelegram.exe")
@@ -964,8 +1395,8 @@ def start_background():
         time.sleep(0.15)
         st = read_state()
         if st.get("pid") and is_running(st["pid"]):
-            return {"already": False, "port": st.get("port"), "pid": st["pid"],
-                    "key": cfg["key"], "device_id": cfg["device_id"]}
+            return {"already": False, "port": st.get("port"), "local_port": st.get("local_port"),
+                    "pid": st["pid"], "key": cfg["key"], "device_id": cfg["device_id"]}
     return {"already": False, "port": None, "pid": proc.pid, "warning": "启动超时，见日志",
             "log": str(log)}
 
@@ -1005,72 +1436,23 @@ def parse_target(text):
 
 def cmd_send(args):
     cfg = load_config()
-    tctx = tls_client_ctx(cfg)
-    text = (args.text or "").strip()
-    if not text:
-        die("请提供 --text")
-    ip, port = parse_target(args.target)
+    text = (args.text or "").strip() or None
+    path = (args.file or "").strip() or None
+    if not text and not path:
+        die("请提供 --text 或 --file")
     store = Store(paths()["db"])
-    try:
-        info = hello(ip, port, cfg["key"], cfg["device_id"], cfg.get("device_name"),
-                     cfg.get("port", DEFAULT_PORT), tls_ctx=tctx)
-    except RuntimeError as e:
-        die(f"{e}\n  本机密钥: {cfg['key']}\n  让对方执行: pair --key {cfg['key']}")
-    except ssl.SSLError as e:
-        if "certificate verify failed" in str(e):
-            die(f"对端证书与已固定指纹不符（TLS 握手拒绝）。\n"
-                f"  若对方确已更换证书：trust --remove <旧指纹前缀> 后重新 trust 配对")
-        die(f"TLS 握手失败：{e}")
-    except Exception as e:
-        # 连不上：如果之前聊过，就按已知设备入队，等对方上线自动补发
-        known = store.find_device(ip)
-        if known and known.get("id") != cfg["device_id"]:
-            conv = f"dm:{known['id']}"
-            store.ensure_conv(conv, known["id"], known.get("name") or "")
-            env = {"id": uuid.uuid4().hex, "conv": conv, "from": cfg["device_id"],
-                   "ts": now_ms(), "kind": "text", "body": {"text": text}, "reply_to": None}
-            store.add_message(env, direction="out", state="queued")
-            store.enqueue(env["id"])
-            print(f"对方暂不可达（{e}），消息已入队；设备 {known.get('name') or known['id'][:8]}"
-                  f" 上线后自动补发")
+    res = server_send(store, cfg, args.target, text, reply_to=None, path=path)
+    if res.get("ok"):
+        if res.get("queued"):
+            print(f"对方暂不可达（{res.get('error', '')}），消息已入队；"
+                  f"设备 {res.get('device', '?')} 上线后自动补发")
             return
-        die(f"连不上 {ip}:{port} —— {e}\n  请确认对方已 serve，且端口放行")
-    if not info:
-        die(f"连不上 {ip}:{port}，请确认对方已 serve，且端口放行")
-    if info.get("device_id") == cfg["device_id"]:
-        die("目标就是本机，换一个地址")
-
-    peer_id = info["device_id"]
-    conv = f"dm:{peer_id}"
-    store.upsert_device(peer_id, info.get("device") or "", ip, port)
-    store.ensure_conv(conv, peer_id, info.get("device") or "")
-
-    env = {"id": uuid.uuid4().hex, "conv": conv, "from": cfg["device_id"],
-           "ts": now_ms(), "kind": "text", "body": {"text": text}, "reply_to": None}
-    store.add_message(env, direction="out", state="queued")
-    try:
-        st, obj = post_message(ip, port, cfg["key"], {**env, "from_name": cfg.get("device_name"),
-                                                     "from_port": cfg.get("port")}, tls_ctx=tctx)
-    except ssl.SSLError as e:
-        store.enqueue(env["id"])
-        die(f"TLS 握手失败：{e}\n  若对方更换过证书，请重新 trust 配对")
-    except Exception as e:
-        store.enqueue(env["id"])
-        print(f"对方暂不可达（{e}），消息已入队，等对方上线自动补发")
+        m = res["message"]
+        print(f"已发送给 {res['device']} ({res['ip']}:{res['port']}) · {fmt_ts(m['ts'])}")
         return
-
-    if st == 200 and obj.get("ok"):
-        store.set_state(env["id"], "delivered" if obj.get("delivered") else "sent")
-        print(f"已发送给 {info.get('device') or peer_id[:8]} ({ip}:{port}) · {fmt_ts(env['ts'])}")
-    elif st == 401:
-        store.enqueue(env["id"])
-        die(f"密钥不匹配（401）。\n  本机密钥: {cfg['key']}")
-    elif st == 403:
-        store.enqueue(env["id"])
-        die(f"证书与声明设备不符（403）：{obj.get('error', '')}")
-    else:
-        store.enqueue(env["id"])
-        print(f"发送失败（HTTP {st}），已入队重试")
+    if res.get("auth"):
+        die(f"{res['error']}\n  本机密钥: {res['key']}\n  让对方执行: pair --key {res['key']}")
+    die(res.get("error") or "发送失败")
 
 
 def cmd_history(args):
@@ -1093,7 +1475,8 @@ def cmd_history(args):
             mark = f"[{unread} 未读] " if unread else ""
             preview = ""
             try:
-                preview = (json.loads(c.get("last_body") or "{}").get("text") or "")[:30]
+                b = json.loads(c.get("last_body") or "{}")
+                preview = b.get("text") or (f"[附件] {b.get('name', '')}"[:28] if b.get("name") else "")
             except Exception:
                 pass
             print(f"  {c['dev_name'] or c['peer_device'][:8]:<16} {mark}{preview}")
@@ -1109,20 +1492,21 @@ def cmd_history(args):
     for m in items:
         who = "我" if m["direction"] == "out" else (store.get_device(m["sender"]) or {}).get("name") or "对方"
         try:
-            text = json.loads(m["body"] or "{}").get("text") or ""
+            body = json.loads(m["body"] or "{}")
         except Exception:
-            text = ""
-        state = {"queued": "待发", "sent": "已发", "delivered": "已送达", "read": "已读"}.get(m["state"], m["state"])
+            body = {}
+        if m["kind"] in ("file", "image"):
+            kb = body.get("size", 0) / 1024
+            size = f"{kb:.0f} KB" if kb < 1024 else f"{kb / 1024:.1f} MB"
+            text = f"[{'图片' if m['kind'] == 'image' else '文件'} {body.get('name', '?')} · {size}]"
+        else:
+            text = body.get("text") or ""
+        state = {"queued": "待发", "sent": "已发", "delivered": "已送达",
+                 "read": "已读", "failed": "失败"}.get(m["state"], m["state"])
         print(f"[{fmt_ts(m['ts'])}] {who}: {text}" + (f"   ({state})" if m["direction"] == "out" else ""))
 
-    # 看完即已读：本地标记 + 回执给对端
-    tctx = tls_client_ctx(cfg)
-    for m in store.unread_inbound(conv):
-        peer = store.get_device(m["sender"])
-        if peer and peer.get("ip"):
-            send_ack(peer["ip"], int(peer.get("port") or DEFAULT_PORT), cfg["key"], m["id"], "read",
-                     tls_ctx=tctx)
-    store.mark_read(conv)
+    # 看完即已读：本地标记 + 回执给对端（与 GUI 共用同一路径）
+    server_mark_read(store, cfg, conv)
 
 
 def cmd_contacts(args):
@@ -1169,6 +1553,30 @@ def cmd_pair(args):
         start_background()
         print("服务已重启")
     print("请在另一台机器上执行同样的命令")
+
+
+def cmd_getfile(args):
+    """把本机存过的附件（收到的或发出的）导出到指定路径。"""
+    import shutil
+    mid = (args.msg or "").strip()
+    msg = Store(paths()["db"]).get_message(mid)
+    if not msg or msg["kind"] not in ("file", "image"):
+        die("未知的附件消息（用 history 查看消息 id）")
+    src = attach_dir() / mid
+    if not src.exists():
+        die("本机没有这份附件（原件未送达或已删除）")
+    out = Path(str(args.out)).expanduser()
+    if out.is_dir():
+        try:
+            name = json.loads(msg["body"] or "{}").get("name") or mid
+        except Exception:
+            name = mid
+        out = out / name
+    try:
+        shutil.copyfile(str(src), str(out))
+        print(f"已保存: {out}（{src.stat().st_size} 字节）")
+    except Exception as e:
+        die(f"保存失败: {e}")
 
 
 def cmd_status(args):
@@ -1322,7 +1730,8 @@ def build_parser():
 
     sp = sub.add_parser("send", help="发送消息")
     sp.add_argument("--target", required=True, help="对方 IP[:端口]")
-    sp.add_argument("--text", required=True)
+    sp.add_argument("--text", help="文本内容")
+    sp.add_argument("--file", help="发送本地文件/图片路径")
     sp.set_defaults(func=cmd_send)
 
     sp = sub.add_parser("history", help="查看会话与历史")
@@ -1352,6 +1761,11 @@ def build_parser():
     sp = sub.add_parser("tls", help="启用/关闭 TLS 1.3（缺省查看状态）")
     sp.add_argument("mode", nargs="?", default="status", choices=["on", "off", "status"])
     sp.set_defaults(func=cmd_tls)
+
+    sp = sub.add_parser("getfile", help="导出本机存过的附件（收到或发出的）")
+    sp.add_argument("--msg", required=True, help="消息 id（history 可见）")
+    sp.add_argument("--out", required=True, help="保存路径（目录或文件）")
+    sp.set_defaults(func=cmd_getfile)
 
     return ap
 

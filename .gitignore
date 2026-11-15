@@ -5,3 +5,9 @@ dist/
 *.spec
 .DS_Store
 Thumbs.db
+
+# Rust/Tauri 构建产物
+target/
+EBWebView/
+WebView2_udf/
+*.exe.WebView2
