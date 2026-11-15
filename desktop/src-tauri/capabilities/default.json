@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "主窗口只用自定义桥接命令与事件，不开任何网络权限",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:default"]
 }

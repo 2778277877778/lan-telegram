@@ -6,8 +6,20 @@ Telegram 式的对话模型——会话、已读回执、离线补发、永久�
 它与 [lan-sync](https://github.com/2778277877778/lan-sync) 互传工具是两个独立应用：lan-sync 是「传完就走」的一次性收发，
 lan-telegram 是「持续对话」的聊天。
 
-> 当前版本 **v0.1.0**：存储、协议、命令行与传输加密已完成（里程碑 M1+M2）。
-> 图形界面（M3）、文件与图片（M4）、群聊（M5）、独立 exe（M6）见[路线图](#路线图)。
+> 当前版本 **v0.2.0**：存储、协议、命令行、传输加密、Liquid Glass 桌面界面、文件/图片传输全部完成（M1–M4）。
+> 群聊（M5）、独立打包优化（M6）见[路线图](#路线图)。Windows 免装 Python 的成品见 [Releases](https://github.com/2778277877778/lan-telegram/releases)。
+
+## 现在能做什么
+
+- **桌面版**（Tauri + Liquid Glass 界面）：会话列表、气泡、✓/✓✓ 送达已读、未读徽标、
+  在线点、图片缩略图、文件卡片、引用回复、向前翻页——双击 `lan-telegram-desktop.exe` 即用，无黑窗
+- 两个实例互相发文本消息、文件与图片（原件+缩略图），历史永久保存在本地 SQLite
+- 已读回执：对方看完，你这边状态从「已送达」变「已读」
+- 消息幂等：同一条重复投递不会产生两条记录
+- 离线队列：对方没开机时消息入队，指数退避（2/5/15/30/60 秒封顶）自动补发——**含附件的完整重传**
+- 历史分页：按时间戳往前翻，不受内存限制
+- **传输加密**：自签证书 + 证书指纹人工核对固定，配对后仅允许 TLS 1.3，
+  未固定 / 换证书的连接在握手层直接拒绝；证书 CN 内嵌设备 ID，TLS 下 `from` 无法伪造
 
 ## 为什么需要它
 
@@ -29,7 +41,10 @@ lan-telegram 的威胁面只有一层局域网：
 
 ## 快速开始
 
-以下假设两台机器：本机与对端 `10.0.0.7`，局域网互通。每台机器各执行一遍。
+**Windows 用户推荐直接下载成品**（Releases 里的 zip）：解压后双击 `lan-telegram-desktop.exe`
+——Liquid Glass 桌面界面，若引擎没在跑会在界面里一键无窗拉起，全程无黑框。
+
+以下命令方式假设两台机器：本机与对端 `10.0.0.7`，局域网互通。每台机器各执行一遍。
 
 ### 1. 起接收服务
 
@@ -84,7 +99,8 @@ python lantelegram.py tls on
 |---|---|
 | `serve [--port N] [--background]` | 启动接收服务。`--port` 在前台启动时写入配置；端口被占自动 +1（上限 20 次），以 `info` 为准 |
 | `stop` / `status` / `info` | 停止 / 状态 / 本机信息（含传输模式与指纹） |
-| `send --target IP[:端口] --text "…"` | 发消息；对方离线自动入队补发 |
+| `send --target IP[:端口] --text "…" [--file 路径]` | 发消息或文件/图片（`.png/.jpg/.gif/.webp/.bmp` 按图片处理）；对方离线自动入队补发（含附件重传） |
+| `getfile --msg ID --out 路径` | 把本机存过的附件（收到的或发出的）导出到指定路径 |
 | `history [--with 设备] [--limit N] [--before TS]` | 会话列表 / 具体聊天记录（看完自动回执已读）；`--before` 按时间戳向前翻页 |
 | `contacts` | 已联系过的设备（IP/端口/最近出现） |
 | `key [--new]` / `pair --key K` | 查看 / 随机换 / 对齐应用层密钥（换 key 自动重启服务） |
@@ -120,8 +136,9 @@ python lantelegram.py tls on
 %USERPROFILE%\.lan-telegram\        ← 环境变量 LAN_TG_HOME 可覆盖（macOS/Linux 为 ~/.lan-telegram）
 ├── config.json      设备 ID / 名称 / 端口 / 应用密钥 / TLS 开关
 ├── messages.db      SQLite：设备、会话、消息、回执、待发队列、事件流
-├── state.json       运行状态（后台服务 PID）
+├── state.json       运行状态（PID / 主端口 / 本机接入口端口）
 ├── server.log       服务日志
+├── attachments/     文件与图片原件（按消息 UUID 命名）+ .thumb 缩略图
 └── certs/
     ├── cert.pem     本机自签证书（把它的指纹念给对方）
     ├── key.pem      本机私钥（留在本机，永不外发）
@@ -139,10 +156,17 @@ HTTP 点对点，端点前缀 `/api/v2`：
 | `/ping` | GET | 探活，返回设备信息（免密钥；TLS 下附带证书指纹） |
 | `/cert` | GET | 本机证书 PEM 与指纹（公开信息，免密钥——配对阶段双方还没有共享密钥） |
 | `/hello` | POST | 握手：交换设备 ID / 名称 / 端口 |
-| `/messages` | POST | 投递消息，按消息 UUID 幂等去重（重复投递只入库一条） |
-| `/events?since=N` | GET | 长轮询增量事件（最多挂 25 秒），预留给界面层 |
+| `/messages` | POST | 投递文本消息，按消息 UUID 幂等去重（重复投递只入库一条） |
+| `/upload` | POST | 投递文件/图片：原始字节流 + 元数据头部；按消息 UUID 去重，≤500 MB |
+| `/file?msg=&thumb=` | GET | 取附件原件或缩略图（渲染/另存/打开用） |
+| `/send` `/conversations` `/contacts` `/read` | POST/GET | 界面层动作（见下「本机接入口」） |
+| `/events?since=N` | GET | 长轮询增量事件（最多挂 25 秒），驱动界面实时刷新 |
 | `/ack` | POST | 已读回执 |
 | `/history` | GET | 分页拉历史 |
+
+**本机接入口**：引擎除对等主端口外，固定另开一个 `127.0.0.1` 明文接入口（默认主端口+1，
+实报于 `state.json.local_port`），只服务界面类端点、拒绝对等协议——桌面壳因此不需要
+持有任何证书，TLS 模式下面板照常工作；引擎重启/端口漂移时，壳按候选端口自动探活重新发现。
 
 鉴权用 `X-Sync-Key` 头（或 `?key=`）。为什么用长轮询而不是 WebSocket、双时间戳防乱序、
 群聊扇出方案等设计取舍，见 [docs/lan-telegram-design.md](docs/lan-telegram-design.md)。
@@ -155,9 +179,11 @@ HTTP 点对点，端点前缀 `/api/v2`：
 # Windows GBK 控制台必须先切 UTF-8，否则脚本打印中文诊断会崩（与测试结果无关）
 $env:PYTHONUTF8="1"
 
-python tests/m1_check.py      # M1 验收 12/12：收发/已读回执/幂等/分页/重启不丢/离线入队
-python tests/resend_check.py  # 离线队列自动补发
-python tests/m2_check.py      # M2 验收 13/13：指纹配对/TLS1.3 强制/明文与 TLS1.2 拒绝/错指纹拒连
+python tests/m1_check.py       # M1 验收 12/12：收发/已读回执/幂等/分页/重启不丢/离线入队
+python tests/resend_check.py   # 离线队列自动补发
+python tests/m2_check.py       # M2 验收 13/13：指纹配对/TLS1.3 强制/明文与 TLS1.2 拒绝/错指纹拒连
+python tests/m3_bridge_check.py # M3 验收 19/19：GUI 端点契约/接入口隔离/TLS 下界面链路
+python tests/m4_files_check.py  # M4 验收 13/13：文件图片/幂等/缩略图/离线附件重传/上限
 ```
 
 常见问题：
@@ -167,17 +193,20 @@ python tests/m2_check.py      # M2 验收 13/13：指纹配对/TLS1.3 强制/明
 | 发送报 401 | 两端密钥不一致：`pair --key <对方密钥>` |
 | TLS 握手失败 / 提示证书不符 | 对方证书已更换：`trust --remove <旧指纹前缀>` 后重新核对 `cert` 指纹并 trust |
 | 一方开了 TLS 就都连不上 | 设计如此，**不会降级**。双方都要完成 trust + tls on |
-| 端口不是 32200 | 被占用时自动 +1，以 `info` 显示为准；固定端口用 `serve --port` |
+| 端口不是 32200 | 被占用时自动 +1，以 `info` 显示为准；桌面壳会按候选端口自动探活找到引擎，无需人工对齐 |
+| 桌面壳显示「本机引擎没有在运行」 | 点「启动服务」或按 Alt+S，无窗口拉起；已双击 `lantelegram.exe serve` 的话它 4 秒内会自动重连 |
+| 发图片对方只看到文件名没看到图 | 那是 CLI 发的（无缩略图），点开即用系统查看器打开；桌面端发的图片自带缩略图 |
 | 报「还没有固定任何对端证书」 | `tls on` 的前置条件：先完成至少一次 trust |
 
 ## 路线图
 
 - [x] **M1** SQLite 存储 + V2 协议 + 命令行 —— 验收 12/12
-- [x] **M2** TLS 1.3 + 自签证书 + 指纹固定 —— 验收 13/13，即本版 v0.1.0
-- [ ] **M3** 图形界面：会话列表 + 气泡聊天窗（Tkinter，`/events` 长轮询驱动）
-- [ ] **M4** 文件与图片、发送进度、缩略图
-- [ ] **M5** 群聊、搜索、引用回复
-- [ ] **M6** PyInstaller 独立 exe（免装 Python；届时 TLS 模式需一并打包 cryptography，体积约 +8 MB）
+- [x] **M2** TLS 1.3 + 自签证书 + 指纹固定 —— 验收 13/13
+- [x] **M3** 桌面图形界面 —— Tauri 2 壳 + Liquid Glass 视觉（改投 webview 方案而非 Tkinter：
+      动画/滚动/图片渲染由 Chromium 承担，性能与观感都更好；Rust 只做桥接，webview 零出网）—— 验收 19/19
+- [x] **M4** 文件与图片、缩略图、断线重传 —— 验收 13/13
+- [ ] **M5** 群聊、搜索、引用回复（引用已在界面/协议层就绪，服务端多端点待做）
+- [x] **M6** Windows 独立 exe —— Releases 提供桌面壳 + 引擎双 exe，免装 Python
 
 每个里程碑独立发版，每个阶段都有可复跑的验收标准（见设计文档 §9）。
 

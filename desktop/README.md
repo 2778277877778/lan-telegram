@@ -1,7 +1,11 @@
-# lan-telegram 桌面壳（M3）
+# lan-telegram 桌面壳（M3/M4）
 
-Telegram 式双栏界面：会话列表（未读徽标/预览/在线点）＋ 气泡对话（✓/✓✓ 回执、
-引用回复、向前分页）＋ 输入栏。明暗主题跟随按钮，localStorage 记忆。
+Telegram 式双栏界面（Liquid Glass 视觉，iOS 27 风格：光晕底层 + 玻璃面板 + 胶囊控件）：
+会话列表（未读徽标/预览/在线点）＋ 气泡对话（✓/✓✓ 回执、图片缩略图、文件卡片、
+右键引用、向前分页）＋ 输入栏。明暗主题跟随按钮，localStorage 记忆。
+
+> v0.2.0 起随 Releases 分发：`lan-telegram-desktop.exe` + `lantelegram.exe` 同目录放置，
+> 双击壳即可用——引擎不在时显示引导卡片，点「启动服务」或按 Alt+S 无黑窗拉起。
 
 ## 架构
 
@@ -15,8 +19,8 @@ Python 引擎（lantelegram.py serve）
 对端机器
 ```
 
-- 桥接层职责：端口/密钥从 `state.json`+`config.json` 自动发现（漂移自愈）、
-  `/events` 长轮询 → `tg-events` 事件推送、全部阻塞 IO 走 `spawn_blocking`。
+- 桥接层职责：端口**自适应发现**（按 state.json 实报口 → 主端口+1..+6 逐个探活，
+  引擎漂口/重启自愈）、`/events` 长轮询 → `tg-events` 事件推送、全部阻塞 IO 走 spawn_blocking。
 - 桌面壳不直连对端：TLS、证书、pins 全部复用引擎（单一事实源）。
 
 ## 开发运行
