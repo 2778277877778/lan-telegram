@@ -229,24 +229,20 @@ async fn contact_list(app: AppHandle) -> Value {
     .await
 }
 
-/// 清掉锁着「旧版 exe 旁 UDF」的孤儿 msedgewebview2 进程（宿主崩溃遗留）。
-/// 只匹配本 exe 文件名的 .WebView2 路径，不动其他应用的 WebView2。
+/// 清掉锁着本应用 WebView2 用户数据目录的孤儿浏览器进程（宿主崩溃遗留）。
+/// 覆盖两类：本 exe 旧版「exe 旁 UDF」（<stem>.exe.WebView2）与当前 EBWebView 目录。
+/// 只按路径匹配，不动其他应用的 WebView2 进程。
 #[cfg(windows)]
-fn kill_orphan_webviews() {
+fn kill_orphan_webviews(udf: &str, stem: &str) {
     use std::os::windows::process::CommandExt;
-    let stem = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-        .unwrap_or_default();
-    if stem.is_empty() {
-        return;
-    }
-    let pattern = format!("{}.exe.WebView2", stem);
+    let legacy = format!("{}.exe.WebView2", stem);
+    let esc = |s: &str| s.replace('\'', "\"'\"'\"\"'");
     let ps = format!(
         "Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" | \
-         Where-Object {{ $_.CommandLine -like '*{}*' }} | \
+         Where-Object {{ $_.CommandLine -like '*{}*' -or $_.CommandLine -like '*{}*' }} | \
          ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }}",
-        pattern
+        esc(udf),
+        esc(&legacy)
     );
     let _ = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", &ps])
@@ -255,7 +251,7 @@ fn kill_orphan_webviews() {
 }
 
 #[cfg(not(windows))]
-fn kill_orphan_webviews() {}
+fn kill_orphan_webviews(_udf: &str, _stem: &str) {}
 
 /// 事件泵：先把存量静默排空（游标对齐到最新），再进入 20 秒长轮询。
 /// 断连时退避并重新发现端口（引擎可能刚重启）。
@@ -332,12 +328,21 @@ fn main() {
     };
 
     // WebView2 用户数据目录：默认在 exe 旁（target/debug/xxx.exe.WebView2）。
-    // 崩溃遗留的 msedgewebview2 会锁住该目录，后续实例以 0x800700AA/拒绝访问 失败。
-    // 1) 把 UDF 挪进数据目录（同时解决 Program Files 不可写）；2) 清掉只锁着旧 UDF 的孤儿进程。
+    // 宿主崩溃遗留的 msedgewebview2 孤儿会锁住目录，让后续实例以 0x800700AA/0x8000FFFF
+    // 失败。对策三件套：UDF 迁入数据目录（顺带解决 Program Files 不可写）、
+    // 启动先清孤儿、窗口创建失败清孤儿后重试。
     let udf = app.home.join("EBWebView");
     let _ = std::fs::create_dir_all(&udf);
     std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &udf);
-    kill_orphan_webviews();
+    let stem = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "lan-telegram-desktop".into());
+    let udf_str = udf.to_string_lossy().into_owned();
+    kill_orphan_webviews(&udf_str, &stem);
+
+    let udf_for_setup = udf_str.clone();
+    let stem_for_setup = stem.clone();
 
     tauri::Builder::default()
         .manage(app)
@@ -349,7 +354,37 @@ fn main() {
             mark_read,
             contact_list
         ])
-        .setup(|a| {
+        .setup(move |a| {
+            // 窗口自建模带重试（配置里的 windows 已置空，避免内部一次性创建）
+            let mut last_err = String::new();
+            for attempt in 0..3 {
+                let built = tauri::WebviewWindowBuilder::new(
+                    a,
+                    "main",
+                    tauri::WebviewUrl::App("index.html".into()),
+                )
+                .title("lan-telegram")
+                .inner_size(960.0, 640.0)
+                .min_inner_size(640.0, 420.0)
+                .center()
+                .build();
+                match built {
+                    Ok(_w) => {
+                        last_err.clear();
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        kill_orphan_webviews(&udf_for_setup, &stem_for_setup);
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        let _ = attempt;
+                    }
+                }
+            }
+            if !last_err.is_empty() {
+                eprintln!("窗口创建失败（已重试 3 次）：{last_err}");
+                return Err(last_err.into());
+            }
             let handle = a.app_handle().clone();
             thread::spawn(move || event_pump(handle));
             Ok(())
