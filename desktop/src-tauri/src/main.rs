@@ -335,6 +335,35 @@ fn which_pythonw() -> String {
     "python3".to_string()
 }
 
+/// 极简百分号编码：只保留 unreserved 字符，其余按 UTF-8 字节转义。
+/// 查询词可能含中文、空格、% 等，必须编码后再拼进查询串。
+fn urlenc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+#[tauri::command]
+async fn search_messages(app: AppHandle, q: String, limit: Option<u64>) -> Value {
+    off(app, move |st| {
+        let n = limit.unwrap_or(50);
+        st.call(
+            "GET",
+            &format!("search?q={}&limit={}", urlenc(&q), n),
+            None,
+            Duration::from_secs(8),
+        )
+    })
+    .await
+}
+
 /// 会话列表（conv 空）或某会话最近消息。
 #[tauri::command]
 async fn read_view(app: AppHandle, conv: Option<String>, limit: Option<u64>) -> Value {
@@ -382,6 +411,7 @@ async fn send_text(app: AppHandle, to: String, text: String, reply_to: Option<St
 }
 
 /// 发文件/图片：path 本机绝对路径；thumb_b64 由前端 canvas 生成的 PNG 缩略图。
+/// client_ref 由前端生成，会原样出现在 progress 事件里，用于把进度绑到对应气泡。
 #[tauri::command]
 async fn send_file(
     app: AppHandle,
@@ -389,6 +419,7 @@ async fn send_file(
     path: String,
     thumb_b64: Option<String>,
     reply_to: Option<String>,
+    client_ref: Option<String>,
 ) -> Value {
     off(app, move |st| {
         let mut body = json!({"to": to, "path": path});
@@ -397,6 +428,9 @@ async fn send_file(
         }
         if let Some(r) = reply_to {
             body["reply_to"] = json!(r);
+        }
+        if let Some(c) = client_ref {
+            body["client_ref"] = json!(c);
         }
         // 大文件在引擎里同步流式传给对端，超时放宽到 5 分钟
         st.call("POST", "send", Some(&body), Duration::from_secs(300))
@@ -658,7 +692,8 @@ fn main() {
             get_blob,
             save_blob,
             open_blob,
-            read_preview
+            read_preview,
+            search_messages
         ])
         .setup(move |a| {
             // 窗口自建模带重试（config 里 windows 置空，避免内部一次性创建）

@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 SERVICE = "lan-telegram"
 DEFAULT_PORT = 32200
 CREATE_NO_WINDOW = 0x08000000
@@ -444,6 +444,32 @@ class Store:
                     (conv, limit)).fetchall()
             return [dict(r) for r in reversed(rows)]
 
+    def search(self, q, limit=50):
+        """全文检索（本地库 SQL LIKE，覆盖文本与附件名）。返回按时间倒序的结果。"""
+        q = (q or "").strip()
+        if not q:
+            return []
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT m.id, m.conv, m.sender, m.ts, m.kind, m.body, m.direction, m.state,"
+                "       c.title AS conv_title, c.peer_device, d.name AS dev_name"
+                "  FROM messages m"
+                "  LEFT JOIN conversations c ON c.id=m.conv"
+                "  LEFT JOIN devices d ON d.id=c.peer_device"
+                " WHERE m.body LIKE ? ESCAPE '\\'"
+                " ORDER BY m.ts DESC LIMIT ?",
+                (like, int(limit))).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            try:
+                item["body"] = json.loads(item.get("body") or "{}")
+            except Exception:
+                item["body"] = {}
+            out.append(item)
+        return out
+
     def unread_inbound(self, conv=None):
         with self.lock:
             if conv:
@@ -555,7 +581,8 @@ def env_row(store, mid):
             "reply_to": msg["reply_to"] or None, "read": msg["read"]}
 
 
-def server_send(store, cfg, ref, text=None, reply_to=None, path=None, thumb_b64=None):
+def server_send(store, cfg, ref, text=None, reply_to=None, path=None, thumb_b64=None,
+                client_ref=None):
     """服务端发送：文本或文件/图片（hello→建档→投递，失败入队补发）。
 
     ref 可以是设备名 / 设备ID / IP / IP:端口；返回结构化结果供 CLI 与 GUI 共用。
@@ -640,10 +667,29 @@ def server_send(store, cfg, ref, text=None, reply_to=None, path=None, thumb_b64=
         _store_attach(mid, Path(str(path)), thumb_b64)
     try:
         if path:
+            # 上传进度：按块回调 → 写入事件流（节流到约 20 次），界面据此画进度条
+            total = os.path.getsize(str(path))
+            step = max(total // 20, 256 * 1024)
+            last = [0]
+
+            def on_progress(sent, size):
+                if sent - last[0] < step and sent < size:
+                    return
+                last[0] = sent
+                store.add_event("progress", {
+                    "id": mid, "client_ref": client_ref or "", "name": body["name"],
+                    "sent": int(sent), "total": int(size),
+                    "percent": int(sent * 100 / size) if size else 100,
+                })
+
+            store.add_event("progress", {"id": mid, "client_ref": client_ref or "",
+                                         "name": body["name"], "sent": 0,
+                                         "total": int(total), "percent": 0})
             st, obj = upload_file(ip, port, cfg["key"],
                                   dict(env, name=body["name"]),
                                   Path(str(path)),
-                                  attach_dir() / (mid + ".thumb"), tls_ctx=tctx)
+                                  attach_dir() / (mid + ".thumb"), tls_ctx=tctx,
+                                  on_progress=on_progress)
         else:
             st, obj = post_message(ip, port, cfg["key"],
                                    {k: v for k, v in e.items() if k != "conv"},
@@ -749,10 +795,12 @@ def send_ack(ip, port, key, mid, state="read", tls_ctx=None):
         pass
 
 
-def upload_file(ip, port, key, meta, file_path, thumb_path=None, tls_ctx=None):
+def upload_file(ip, port, key, meta, file_path, thumb_path=None, tls_ctx=None,
+                on_progress=None):
     """把本地文件作为消息体上传给对端（M4：文件/图片）。
 
     meta 含 id/kind/ts/from/from_name/from_port/name；缩略图（若有）走 X-Thumb 头。
+    on_progress(sent_bytes, total_bytes) 每块回调一次，供上层发进度事件。
     返回 (status, obj)。失败抛异常。
     """
     conn_cls = http.client.HTTPSConnection if tls_ctx is not None else http.client.HTTPConnection
@@ -785,12 +833,19 @@ def upload_file(ip, port, key, meta, file_path, thumb_path=None, tls_ctx=None):
                 conn.putheader(k, v)
             conn.endheaders()
             left = size
+            sent = 0
             while left > 0:
                 chunk = f.read(min(1 << 20, left))
                 if not chunk:
                     break
                 conn.send(chunk)
                 left -= len(chunk)
+                sent += len(chunk)
+                if on_progress:
+                    try:
+                        on_progress(sent, size)
+                    except Exception:
+                        pass
         resp = conn.getresponse()
         raw = resp.read().decode("utf-8", "ignore")
         try:
@@ -881,6 +936,8 @@ class Handler(BaseHTTPRequestHandler):
             out = {
                 "ok": True, "service": SERVICE, "version": VERSION,
                 "device": cfg.get("device_name"), "device_id": cfg.get("device_id"),
+                "port": int(cfg.get("port") or DEFAULT_PORT),
+                "ips": local_ips(),
                 "auth_required": True,
             }
             if cfg.get("tls") and paths()["self_cert"].exists():
@@ -972,6 +1029,18 @@ class Handler(BaseHTTPRequestHandler):
                 item.pop("last_body", None)
                 out.append(item)
             return self._json(200, {"ok": True, "conversations": out})
+
+        if route == "/api/v2/search":
+            q = (query.get("q", [""])[0]).strip()
+            try:
+                limit = int(query.get("limit", ["50"])[0] or 50)
+            except ValueError:
+                limit = 50
+            if not q:
+                return self._json(400, {"ok": False, "error": "缺少查询词 q"})
+            items = self.server.store.search(q, limit=max(1, min(limit, 200)))
+            return self._json(200, {"ok": True, "query": q, "count": len(items),
+                                    "items": items})
 
         if route == "/api/v2/contacts":
             return self._json(200, {"ok": True, "contacts": self.server.store.devices_public()})
@@ -1129,7 +1198,7 @@ class Handler(BaseHTTPRequestHandler):
             if not ref or (not text and not path):
                 return self._json(400, {"ok": False, "error": "缺少 to 与 text/path"})
             res = server_send(store, cfg, ref, text, obj.get("reply_to"),
-                              path, obj.get("thumb_b64"))
+                              path, obj.get("thumb_b64"), obj.get("client_ref"))
             return self._json(200 if res.get("ok") else 400, res)
 
         if route == "/api/v2/read":
@@ -1230,6 +1299,48 @@ def outbox_worker(store, cfg, stop_event):
 
 
 # ---------------------------------------------------------------- 命令
+
+
+def local_ips():
+    """本机可用于局域网互连的 IPv4 列表（去掉回环与链路本地）。"""
+    ips = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip.startswith("127.") or ip.startswith("169.254.") or ip in ips:
+                continue
+            ips.append(ip)
+    except Exception:
+        pass
+    # UDP 连一个外部地址只是为了让内核选出主网卡 IP，不实际发包
+    for probe in ("8.8.8.8", "1.1.1.1"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.3)
+            s.connect((probe, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.insert(0, ip)
+            if ip:
+                break
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return ips
+
+
+def local_info_card(cfg, port=None):
+    """给界面用：本机标识 + 可连地址，方便念给对方。"""
+    return {
+        "device_name": cfg.get("device_name"),
+        "device_id": cfg.get("device_id"),
+        "port": int(port or cfg.get("port") or DEFAULT_PORT),
+        "ips": local_ips(),
+        "tls": bool(cfg.get("tls")),
+    }
 
 
 def cmd_info(args):
@@ -1509,6 +1620,38 @@ def cmd_history(args):
     server_mark_read(store, cfg, conv)
 
 
+def cmd_search(args):
+    """本地全文检索：在自己的消息库里找关键词。"""
+    q = (args.query or "").strip()
+    if not q:
+        die("请提供搜索词，例如：search --query 接口")
+    store = Store(paths()["db"])
+    items = store.search(q, limit=args.limit)
+    if not items:
+        print(f"没有找到包含「{q}」的消息。")
+        return
+    print(f"=== 含「{q}」的消息（{len(items)} 条，按时间倒序）===")
+    for it in items:
+        conv = it.get("conv") or ""
+        if conv.startswith("dm:"):
+            who = it.get("dev_name") or conv[3:11]
+            kind = "会话"
+        else:
+            who = it.get("conv_title") or conv
+            kind = "群聊"
+        try:
+            body = it.get("body") if isinstance(it.get("body"), dict) else json.loads(it.get("body") or "{}")
+        except Exception:
+            body = {}
+        if it.get("kind") in ("file", "image"):
+            text = f"[{'图片' if it['kind'] == 'image' else '文件'} {body.get('name', '')}]"
+        else:
+            text = body.get("text") or ""
+        direction = "我" if it.get("direction") == "out" else who
+        print(f"[{fmt_ts(it.get('ts'))}] ({kind} {who}) {direction}: {text[:80]}")
+        print(f"           conv: {conv}   id: {it.get('id')}")
+
+
 def cmd_contacts(args):
     store = Store(paths()["db"])
     with store.lock:
@@ -1739,6 +1882,11 @@ def build_parser():
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--before", type=int, default=0, help="按时间戳翻页")
     sp.set_defaults(func=cmd_history)
+
+    sp = sub.add_parser("search", help="搜索本地消息（含附件名）")
+    sp.add_argument("--query", "-q", dest="query", default="", help="关键词")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("key", help="查看或更换密钥")
     sp.add_argument("--new", action="store_true")
