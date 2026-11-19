@@ -9,8 +9,8 @@ Telegram 式的对话模型——会话、已读回执、离线补发、永久�
 它与 [lan-sync](https://github.com/2778277877778/lan-sync) 互传工具是两个独立应用：lan-sync 是「传完就走」的一次性收发，
 lan-telegram 是「持续对话」的聊天。
 
-> 最新发布 **v0.3.1**（Liquid Glass 界面增强）：存储、命令行、TLS 1.3 指纹固定、桌面客户端、文件/图片传输全部可用。
-> Windows 免安装成品见 [Releases](https://github.com/2778277877778/lan-telegram/releases)；下一里程碑 M5 群聊/搜索/发送进度。
+> 最新发布 **v0.4.0**（Telegram 风格界面 · IP 一眼可见 · 消息搜索 · 上传进度）。
+> Windows 免安装成品见 [Releases](https://github.com/2778277877778/lan-telegram/releases)；下一里程碑 M5 群聊。
 
 ## 现在能做什么
 
@@ -207,9 +207,9 @@ python tests/m4_files_check.py  # M4 验收 13/13：文件图片/幂等/缩略�
 - [x] **M2** TLS 1.3 + 自签证书 + 指纹固定 —— 验收 13/13
 - [x] **M3** 桌面图形界面 —— Tauri 2 壳 + Liquid Glass 视觉（改投 webview 方案而非 Tkinter：
       动画/滚动/图片渲染由 Chromium 承担，性能与观感都更好；Rust 只做桥接，webview 零出网）—— 验收 19/19
-- [x] **M4** 文件与图片、缩略图、断线重传 —— 验收 13/13（发送进度条归入 M5）
-- [ ] **M5** 群聊、搜索、引用回复（引用已就绪）、发送进度 —— v0.3.0
-- [x] **M6** Windows 独立 exe —— v0.2.0 Release 双 exe 分发（macOS/Linux 打包待做）
+- [x] **M4** 文件与图片、缩略图、断线重传、上传进度 —— 验收 13/13
+- [x] **M5（部分）** 消息搜索 + 发送进度 —— 验收 19/19；群聊待做
+- [x] **M6** Windows 独立 exe —— v0.4.0 Release 双 exe 分发（macOS/Linux 打包待做）
 
 每个里程碑独立发版，每个阶段都有可复跑的验收标准（见设计文档 §9）。
 
