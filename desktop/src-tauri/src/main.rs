@@ -49,8 +49,10 @@ impl App {
     }
 
     /// 自适应端口发现：按候选顺序探活 /api/v2/ping，取第一个应答者。
-    /// 候选 = state.json 实报 local_port → state port+1 → config port+1..+6。
-    /// 引擎漂端口/重启换口/多实例共存都能自愈，不再依赖单一约定。
+    /// 候选 = state 实报 local_port → 主端口+1 → 配置主端口..+20 → state 主端口。
+    /// 候选里可能是「本机接入口」也可能是「对等主端口」：用 ping 里的 local_port
+    /// 字段判断——若应答口中的 local_port 等于别的端口，说明命中的是主口，
+    /// 优先切到它报告的本机接入口（TLS 模式下只有接入口是明文的）。
     fn resolve(&self) -> Result<Bridge, String> {
         let cfg = self.read_json("config.json");
         let key = cfg
@@ -63,11 +65,13 @@ impl App {
         }
         let state = self.read_json("state.json");
         let mut cands: Vec<u16> = Vec::new();
-        let push = |v: Option<u64>, c: &mut Vec<u16>| {
-            if let Some(p) = v {
-                let p = p as u16;
-                if !c.contains(&p) {
-                    c.push(p);
+        let push = |p: Option<u64>, c: &mut Vec<u16>| {
+            if let Some(v) = p {
+                if v > 0 && v < 65536 {
+                    let v = v as u16;
+                    if !c.contains(&v) {
+                        c.push(v);
+                    }
                 }
             }
         };
@@ -77,34 +81,53 @@ impl App {
             &mut cands,
         );
         if let Some(cp) = cfg.get("port").and_then(Value::as_u64) {
-            for k in 1..=6u64 {
+            for k in 0..=20u64 {
                 push(Some(cp + k), &mut cands);
             }
+            push(Some(cp + 1), &mut cands);
         }
+        push(state.get("port").and_then(Value::as_u64), &mut cands);
+
         for &p in &cands {
-            if Self::probe(p, &key) {
-                return Ok(Bridge { port: p, key });
+            let payload = match Self::probe_payload(p, &key) {
+                Some(v) => v,
+                None => continue,
+            };
+            // 应答口若是主端口，ping 会报告真正的本机接入口
+            let reported_local = payload
+                .get("local_port")
+                .and_then(Value::as_u64)
+                .map(|v| v as u16);
+            if let Some(lp) = reported_local {
+                if lp != p && Self::probe(lp, &key) {
+                    return Ok(Bridge { port: lp, key });
+                }
             }
+            return Ok(Bridge { port: p, key });
         }
-        Err("没找到在跑的本机引擎接口（serve 未运行？可点「启动服务」）".into())
+        Err("没找到在跑的本机引擎接口（serve 未运行？界面会自动尝试启动）".into())
+    }
+
+    /// 探活并取回 /ping 的 JSON。
+    fn probe_payload(port: u16, key: &str) -> Option<Value> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(900))
+            .no_proxy()
+            .build()
+            .ok()?;
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/api/v2/ping", port))
+            .header("X-Sync-Key", key)
+            .send()
+            .ok()?;
+        if resp.status().as_u16() != 200 {
+            return None;
+        }
+        resp.json::<Value>().ok().filter(|v| v.get("ok").is_some())
     }
 
     fn probe(port: u16, key: &str) -> bool {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(800))
-            .no_proxy()
-            .build();
-        match client {
-            Ok(c) => match c
-                .get(format!("http://127.0.0.1:{}/api/v2/ping", port))
-                .header("X-Sync-Key", key)
-                .send()
-            {
-                Ok(r) => r.status().as_u16() == 200,
-                Err(_) => false,
-            },
-            Err(_) => false,
-        }
+        Self::probe_payload(port, key).is_some()
     }
 
     fn bridge(&self) -> Result<Bridge, String> {
@@ -239,13 +262,31 @@ async fn engine_state(app: AppHandle) -> Value {
                 .unwrap_or(Value::Null),
             Err(_) => Value::Null,
         };
+        let state = st.read_json("state.json");
+        let ping_ok = ping != serde_json::Value::Null;
+        // 端口优先取引擎自报，其次 state.json / config.json——即使 ping 失败也能显示
+        let main_port = ping
+            .get("port")
+            .and_then(Value::as_u64)
+            .or_else(|| state.get("port").and_then(Value::as_u64))
+            .or_else(|| cfg.get("port").and_then(Value::as_u64));
+        let local_port = ping
+            .get("local_port")
+            .and_then(Value::as_u64)
+            .or_else(|| state.get("local_port").and_then(Value::as_u64))
+            .or_else(|| b.as_ref().ok().map(|x| x.port as u64))
+            .map(Value::from)
+            .unwrap_or(Value::Null);
+        let ips = ping.get("ips").cloned().unwrap_or(json!([]));
         Ok(json!({
             "ok": true,
-            "running": ping != serde_json::Value::Null,
+            "running": ping_ok,
             "tls": cfg.get("tls").and_then(Value::as_bool).unwrap_or(false),
             "device_name": cfg.get("device_name").cloned().unwrap_or(Value::Null),
             "device_id": cfg.get("device_id").cloned().unwrap_or(Value::Null),
-            "local_port": b.as_ref().map(|x| json!(x.port)).unwrap_or(Value::Null),
+            "port": main_port,
+            "local_port": local_port,
+            "ips": ips,
             "ping": ping,
         }))
     })
@@ -253,6 +294,7 @@ async fn engine_state(app: AppHandle) -> Value {
 }
 
 /// 引擎没跑时由界面一键拉起：无黑窗启动，然后等探活成功。
+/// 直接起 `serve`（不带 --background，避免多一层子进程导致 pid 记录错位）。
 #[tauri::command]
 async fn ensure_server(app: AppHandle) -> Value {
     off(app, |st| {
@@ -264,6 +306,7 @@ async fn ensure_server(app: AppHandle) -> Value {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
         let mut launched = false;
+        let mut spawned_path = String::new();
         // 1) 发布形态：桌面壳同目录（或 engine/ 子目录）的 lantelegram.exe
         for cand in [
             exe_dir.join("lantelegram.exe"),
@@ -271,7 +314,7 @@ async fn ensure_server(app: AppHandle) -> Value {
         ] {
             if cand.exists() {
                 let mut cmd = std::process::Command::new(&cand);
-                cmd.args(["serve", "--background"]);
+                cmd.arg("serve");
                 #[cfg(windows)]
                 {
                     use std::os::windows::process::CommandExt;
@@ -281,6 +324,7 @@ async fn ensure_server(app: AppHandle) -> Value {
                     .stderr(std::process::Stdio::null())
                     .spawn();
                 launched = true;
+                spawned_path = cand.to_string_lossy().into_owned();
                 break;
             }
         }
@@ -292,7 +336,7 @@ async fn ensure_server(app: AppHandle) -> Value {
                 if script.exists() {
                     let pyw = which_pythonw();
                     let mut cmd = std::process::Command::new(&pyw);
-                    cmd.arg(&script).args(["serve", "--background"]);
+                    cmd.arg(&script).arg("serve");
                     cmd.env("LAN_TG_HOME", &st.home);
                     #[cfg(windows)]
                     {
@@ -303,6 +347,7 @@ async fn ensure_server(app: AppHandle) -> Value {
                         .stderr(std::process::Stdio::null())
                         .spawn();
                     launched = true;
+                    spawned_path = script.to_string_lossy().into_owned();
                     break;
                 }
                 dir = match dir.parent() {
@@ -312,15 +357,21 @@ async fn ensure_server(app: AppHandle) -> Value {
             }
         }
         if !launched {
-            return Ok(json!({"ok": false, "error": "找不到 lantelegram.exe 或 lantelegram.py"}));
+            return Ok(json!({"ok": false, "error":
+                "找不到 lantelegram.exe（应与桌面壳放在同一目录）"}));
         }
-        for _ in 0..40 {
+        // 轮询到引擎应答（引擎内部有单实例保护，不会重复起）
+        for _ in 0..70 {
             thread::sleep(Duration::from_millis(400));
             if let Ok(b) = st.force_refresh() {
-                return Ok(json!({"ok": true, "running": true, "started": true, "port": b.port}));
+                return Ok(json!({"ok": true, "running": true, "started": true,
+                                 "port": b.port, "exe": spawned_path}));
             }
         }
-        Ok(json!({"ok": false, "error": "已尝试启动，16 秒内引擎未应答，请看 server.log"}))
+        Ok(json!({"ok": false,
+                  "error": format!("已启动 {}，但 28 秒内引擎未应答。请查看数据目录下 server.log",
+                                   spawned_path),
+                  "exe": spawned_path}))
     })
     .await
 }

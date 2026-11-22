@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 SERVICE = "lan-telegram"
 DEFAULT_PORT = 32200
 CREATE_NO_WINDOW = 0x08000000
@@ -937,6 +937,8 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True, "service": SERVICE, "version": VERSION,
                 "device": cfg.get("device_name"), "device_id": cfg.get("device_id"),
                 "port": int(cfg.get("port") or DEFAULT_PORT),
+                "local_port": getattr(self.server, "local_port", None),
+                "pid": os.getpid(),
                 "ips": local_ips(),
                 "auth_required": True,
             }
@@ -1302,34 +1304,57 @@ def outbox_worker(store, cfg, stop_event):
 
 
 def local_ips():
-    """本机可用于局域网互连的 IPv4 列表（去掉回环与链路本地）。"""
-    ips = []
+    """本机可互连的 IPv4 列表（含 VPN 虚拟网卡），去回环/链路本地。
+
+    顺序：VPN/私网地址优先（跨机互连通常走这些），然后是其余地址。
+    做法：gethostbyname_ex 拿到主机名绑定的所有地址（含 Radmin/ZeroTier/Tailscale 等
+    虚拟网卡的 26.x / 25.x / 100.64.x），再用 UDP「探路」补上默认路由的主网卡地址。
+    """
+    found = []
+
+    def add(ip):
+        if not ip or ip in found:
+            return
+        if ip.startswith("127.") or ip.startswith("169.254.") or ip == "0.0.0.0":
+            return
+        found.append(ip)
+
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if ip.startswith("127.") or ip.startswith("169.254.") or ip in ips:
-                continue
-            ips.append(ip)
+        _, _, addrs = socket.gethostbyname_ex(socket.gethostname())
+        for ip in addrs:
+            add(ip)
     except Exception:
         pass
-    # UDP 连一个外部地址只是为了让内核选出主网卡 IP，不实际发包
-    for probe in ("8.8.8.8", "1.1.1.1"):
+    # UDP connect 不实际发包，只为让内核给出到该目标所走的源地址
+    for probe in ("8.8.8.8", "1.1.1.1", "26.0.0.1"):
+        s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(0.3)
             s.connect((probe, 80))
-            ip = s.getsockname()[0]
-            s.close()
-            if ip and not ip.startswith("127.") and ip not in ips:
-                ips.insert(0, ip)
-            if ip:
-                break
+            add(s.getsockname()[0])
         except Exception:
+            pass
+        finally:
             try:
-                s.close()
+                if s:
+                    s.close()
             except Exception:
                 pass
-    return ips
+
+    def rank(ip):
+        """VPN / 常见私网段排前面。"""
+        vpn_prefixes = ("26.", "25.", "100.64.", "100.65.", "100.66.", "100.67.",
+                        "100.68.", "100.69.", "100.7", "10.8.", "172.27.")
+        private = ("10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2",
+                   "172.30.", "172.31.", "192.168.")
+        if ip.startswith(vpn_prefixes):
+            return 0
+        if ip.startswith(private):
+            return 1
+        return 2
+
+    return sorted(found, key=rank)
 
 
 def local_info_card(cfg, port=None):
@@ -1374,9 +1399,27 @@ def cmd_serve(args):
         save_config(cfg)
     port = int(cfg.get("port", DEFAULT_PORT))
 
+    # 单实例保护：已有本机引擎在应答（同一 device_id）就校正状态并退出，
+    # 避免多引擎抢同一数据目录（本次故障的直接原因）。
+    live = find_live_engine(cfg)
+    if live:
+        _refresh_state_from(live)
+        print(f"[lan-telegram] 服务已在运行（端口 {live['port']}，本机接入口 {live['local_port']}），"
+              f"本次启动退出")
+        return
     prev = read_state()
-    if prev.get("pid") and prev["pid"] != os.getpid() and is_running(prev["pid"]):
-        die(f"服务已在运行（PID {prev['pid']}，端口 {prev.get('port')}）")
+    if prev.get("pid") and prev["pid"] != os.getpid() and is_engine_pid(prev["pid"]):
+        # pid 确实是引擎但 ping 不应答：可能正在启动或已卡死，等一下再判
+        for _ in range(10):
+            time.sleep(0.3)
+            live = find_live_engine(cfg)
+            if live:
+                _refresh_state_from(live)
+                print(f"[lan-telegram] 服务已在运行（端口 {live['port']}），本次启动退出")
+                return
+        write_state({})   # 清掉僵尸状态，继续本次启动
+    elif prev.get("pid"):
+        write_state({})       # pid 不是引擎（已被回收/复用）→ 直接清掉
 
     store = Store(paths()["db"])
 
@@ -1425,6 +1468,8 @@ def cmd_serve(args):
         die("找不到可用的本机接入口（主端口+1 起被占用）")
     gui.sync_key, gui.store, gui.cfg = cfg["key"], store, cfg
     gui.tls, gui.local = False, True
+    gui.local_port = gui_port
+    srv.local_port = gui_port          # 主端口的 /ping 也要报告本机接入口
     threading.Thread(target=gui.serve_forever, daemon=True).start()
 
     stop_event = threading.Event()
@@ -1449,6 +1494,7 @@ def cmd_serve(args):
 
 
 def is_running(pid) -> bool:
+    """PID 是否存活（不判断身份，仅用于 UI 显示）。"""
     if not pid:
         return False
     try:
@@ -1479,12 +1525,174 @@ def is_running(pid) -> bool:
         return False
 
 
+def pid_image(pid):
+    """取进程可执行文件名（小写）。失败返回空串。"""
+    try:
+        pid = int(pid)
+    except Exception:
+        return ""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = k32.OpenProcess(0x1000, False, pid)
+            if not h:
+                return ""
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = wintypes.DWORD(1024)
+                if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                    return Path(buf.value).name.lower()
+                return ""
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return ""
+    try:
+        return Path(os.readlink(f"/proc/{int(pid)}/exe")).name.lower()
+    except Exception:
+        return ""
+
+
+def pid_cmdline(pid):
+    """取进程命令行（Windows 走 PowerShell CIM；Linux 读 /proc）。失败返回空串。"""
+    try:
+        pid = int(pid)
+    except Exception:
+        return ""
+    if os.name != "nt":
+        try:
+            return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "ignore")
+        except Exception:
+            return ""
+    try:
+        ps = ("(Get-CimInstance Win32_Process -Filter \"ProcessId=%d\").CommandLine" % pid)
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=8,
+                           creationflags=CREATE_NO_WINDOW)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def is_engine_pid(pid) -> bool:
+    """PID 存活**且**确实是本引擎进程（防 PID 回收 / 误杀其它 python）。"""
+    if not is_running(pid):
+        return False
+    try:
+        if int(pid) == os.getpid():
+            return True
+    except Exception:
+        pass
+    img = pid_image(pid)
+    if img.startswith("lantelegram") or img.startswith("lan-telegram"):
+        return True
+    if img.startswith("python"):
+        # 开发形态：命令行里必须出现 lantelegram(.py|.exe)，否则不是我们的引擎
+        return "lantelegram" in pid_cmdline(pid).lower()
+    return False
+
+
+def _refresh_state_from(live):
+    """把 state.json 校正为活引擎自报的 pid/端口（修掉僵尸状态）。"""
+    if not live:
+        return
+    payload = live.get("payload") or {}
+    st = read_state()
+    new = {
+        "pid": payload.get("pid") or st.get("pid"),
+        "port": live.get("port") or st.get("port"),
+        "local_port": live.get("local_port") or st.get("local_port"),
+        "started": st.get("started") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "refreshed": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if any(st.get(k) != new.get(k) for k in ("pid", "port", "local_port")):
+        write_state(new)
+
+
+def engine_ping(port, key, timeout=1.0):
+    """访问 127.0.0.1:port 的 /ping；成功返回 json，失败返回 None。"""
+    import http.client
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
+        conn.request("GET", "/api/v2/ping", headers={"X-Sync-Key": key})
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        if resp.status != 200:
+            return None
+        obj = json.loads(raw.decode("utf-8", "ignore") or "{}")
+        return obj if obj.get("ok") else None
+    except Exception:
+        return None
+
+
+def find_live_engine(cfg=None, probe_local=True):
+    """找出本机正在服务的引擎：返回 {port, local_port, device_id, payload} 或 None。
+
+    候选端口来自 state.json 实报值、配置主端口，以及主端口后 20 个（引擎漂口范围）。
+    逐个用 /ping 验证——这样即使 state.json 陈旧、端口漂移、有多个实例，也能找到活的。
+    """
+    cfg = cfg or load_config()
+    key = cfg.get("key", "")
+    st = read_state()
+    cands = []
+    for v in (st.get("local_port"), st.get("port"), cfg.get("port")):
+        try:
+            v = int(v)
+        except Exception:
+            continue
+        for p in (v, v + 1):
+            if 1 <= p <= 65535 and p not in cands:
+                cands.append(p)
+    try:
+        base = int(cfg.get("port") or DEFAULT_PORT)
+        for p in range(base, base + 21):
+            if p not in cands:
+                cands.append(p)
+    except Exception:
+        pass
+    for p in cands:
+        obj = engine_ping(p, key, timeout=0.6)
+        if not obj:
+            continue
+        # 只认属于本数据目录的引擎：device_id 必须一致，避免误采用另一个 home 的实例
+        if cfg.get("device_id") and obj.get("device_id") != cfg.get("device_id"):
+            continue
+        main_port = int(obj.get("port") or p)
+        lp = obj.get("local_port")
+        lp = int(lp) if lp else None
+        if probe_local:
+            # 命中的若是「主端口」，ping 会报告真正的本机接入口，优先用它
+            if lp and lp != p and engine_ping(lp, key, timeout=0.6):
+                return {"port": main_port, "local_port": lp,
+                        "device_id": obj.get("device_id"), "payload": obj}
+            return {"port": main_port, "local_port": p,
+                    "device_id": obj.get("device_id"), "payload": obj}
+        return {"port": main_port, "local_port": lp,
+                "device_id": obj.get("device_id"), "payload": obj}
+    return None
+
+
 def start_background():
     cfg = load_config()
+    log = paths()["log"]
+    paths()["root"].mkdir(parents=True, exist_ok=True)
+
+    # 1) 已有活引擎 → 直接采用（不重复启动），并校正 state.json
+    live = find_live_engine(cfg)
+    if live:
+        _refresh_state_from(live)
+        return {"already": True, "port": live["port"], "local_port": live["local_port"],
+                "pid": live["payload"].get("pid"), "key": cfg["key"],
+                "device_id": cfg["device_id"]}
+
+    # 2) state.json 指向的 pid 若不在了（或不是引擎），先清掉僵尸状态
     st = read_state()
-    if st.get("pid") and is_running(st["pid"]):
-        return {"already": True, "port": st.get("port"), "local_port": st.get("local_port"),
-                "pid": st["pid"]}
+    if st.get("pid") and not is_engine_pid(st["pid"]):
+        write_state({})
+
     if getattr(sys, "frozen", False):
         exe = sys.executable
         sib = Path(exe).with_name("lantelegram.exe")
@@ -1493,8 +1701,6 @@ def start_background():
         cmd = [exe, "serve"]
     else:
         cmd = [sys.executable, os.path.abspath(__file__), "serve"]
-    log = paths()["log"]
-    paths()["root"].mkdir(parents=True, exist_ok=True)
     flags = 0x00000008 | 0x00000200 | CREATE_NO_WINDOW if os.name == "nt" else 0
     env = dict(os.environ)
     env.pop("_PYI_APPLICATION_HOME_DIR", None)
@@ -1502,32 +1708,54 @@ def start_background():
     with open(log, "a", encoding="utf-8") as logf:
         proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
                                 creationflags=flags, close_fds=True, env=env)
-    for _ in range(40):
+    # 3) 轮询到活引擎或进程退出（最多 ~12 秒）
+    for _ in range(80):
         time.sleep(0.15)
-        st = read_state()
-        if st.get("pid") and is_running(st["pid"]):
-            return {"already": False, "port": st.get("port"), "local_port": st.get("local_port"),
-                    "pid": st["pid"], "key": cfg["key"], "device_id": cfg["device_id"]}
-    return {"already": False, "port": None, "pid": proc.pid, "warning": "启动超时，见日志",
-            "log": str(log)}
+        live = find_live_engine(cfg, probe_local=True)
+        if live:
+            _refresh_state_from(live)
+            return {"already": False, "port": live["port"], "local_port": live["local_port"],
+                    "pid": live["payload"].get("pid") or proc.pid,
+                    "key": cfg["key"], "device_id": cfg["device_id"]}
+        if proc.poll() is not None:
+            break
+    tail = ""
+    try:
+        with open(log, "r", encoding="utf-8", errors="ignore") as f:
+            tail = "".join(f.readlines()[-6:]).strip()
+    except Exception:
+        pass
+    return {"already": False, "error": "引擎启动失败或超时",
+            "detail": tail, "log": str(log), "pid": proc.pid}
 
 
 def stop_service(quiet=False):
+    cfg = load_config()
     st = read_state()
     pid = st.get("pid")
-    if not pid or not is_running(pid):
+    target = None
+    if pid and int(pid) != os.getpid() and is_engine_pid(pid):
+        target = int(pid)
+    else:
+        # state 不可信：向活引擎问它自己的 pid（只杀确认是引擎的进程）
+        live = find_live_engine(cfg)
+        if live:
+            p = (live.get("payload") or {}).get("pid")
+            if p and is_engine_pid(p):
+                target = int(p)
+    if not target:
         write_state({})
         if not quiet:
             print("[lan-telegram] 服务未在运行")
         return False
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
+            subprocess.run(["taskkill", "/F", "/PID", str(target)], capture_output=True,
                            creationflags=CREATE_NO_WINDOW, timeout=15)
         else:
-            os.kill(int(pid), 15)
+            os.kill(target, 15)
         if not quiet:
-            print(f"[lan-telegram] 已停止（PID {pid}）")
+            print(f"[lan-telegram] 已停止（PID {target}）")
     except Exception as e:
         if not quiet:
             print(f"[错误] 停止失败: {e}", file=sys.stderr)

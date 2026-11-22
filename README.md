@@ -8,7 +8,8 @@ Telegram 式的对话体验——会话列表、气泡、送达/已读回执、�
 它与 [lan-sync](https://github.com/2778277877778/lan-sync) 互传工具是两个独立应用：
 lan-sync 是「传完就走」的一次性收发，lan-telegram 是「持续对话」的聊天。
 
-> 最新发布 **v0.4.0**：Telegram Web 风格界面 · IP 一眼可见 · 消息搜索 · 上传进度。
+> 最新发布 **v0.4.1**：Telegram 风格界面 · IP 一眼可见（含 VPN 多网卡）· 消息搜索 · 上传进度 ·
+> 修掉「引擎起不来 / 取不到端口」的进程管理问题。
 > Windows 免安装成品见 [Releases](https://github.com/2778277877778/lan-telegram/releases)。
 
 ## 现在能做什么
@@ -180,7 +181,10 @@ python tests/m2_check.py              # M2 13/13：指纹配对/TLS1.3 强制/�
 python tests/m3_bridge_check.py       # M3 19/19：GUI 端点契约/接入口隔离/TLS 下界面链路
 python tests/m4_files_check.py        # M4 13/13：文件图片/幂等/缩略图/离线重传/上限
 python tests/m5_search_progress_check.py  # M5 19/19：搜索转义与权限/上传进度事件
+python tests/m6_runtime_check.py      # 运行时 15/15：僵尸 state/单实例/端口漂移/自动拉起/IP 列表
 ```
+
+一次跑完：`python tests/run_all.py`（7 套，逐项打印汇总）。
 
 常见问题：
 
@@ -191,8 +195,9 @@ python tests/m5_search_progress_check.py  # M5 19/19：搜索转义与权限/上
 | TLS 握手失败 / 提示证书不符 | 对方换过证书：`trust --remove <旧指纹前缀>` 后重新核对 `cert` 指纹再 trust |
 | 一方开了 TLS 就都连不上 | 设计如此，**不会降级**。双方都要完成 trust + tls on |
 | 端口不是 32200 | 被占用会自动 +1；桌面壳按候选端口自动探活，无需人工对齐 |
-| 界面显示「引擎没有运行」 | 点「启动服务」或 <kbd>Alt</kbd>+<kbd>S</kbd>；已手动 `serve` 的话 4 秒内自动重连 |
-| 发图片对方只看到文件名 | 那是 CLI 发的（无缩略图），点开用系统查看器打开；桌面端发的自带缩略图 |
+| 界面显示「引擎没有运行」 | 壳会自动尝试启动（最多 3 次）；都失败时看数据目录下 `server.log` 末尾的报错 |
+| 取不到 IP / 端口显示 `?` | 说明引擎没在应答。先点「重试启动」；仍不行就 `lantelegram.exe stop` 后重开界面（v0.4.1 已能自动清僵尸状态与多实例） |
+| 开了 VPN 后地址变了 | 正常。侧栏显示的是**当前各网卡地址**（VPN 虚拟网卡优先），点徽标复制的是首选地址；全部地址在右侧 ⓘ 面板里 |
 | 搜不到消息 | 搜索只覆盖**本机**历史；换关键词或用附件名 |
 
 ## 路线图

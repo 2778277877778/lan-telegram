@@ -14,6 +14,8 @@ const S = {
   me: { name: "?", id: "", addr: "" },
   tls: false,
   port: null,
+  ips: [],
+  starting: false,
   convs: [],
   contacts: new Map(),
   active: null,
@@ -332,19 +334,25 @@ function resetInfoPanel() {
   $("info-tls").textContent = S.tls ? "TLS 1.3 已启用" : "明文";
 }
 
-function setMyAddress(addr) {
-  S.me.addr = addr || "";
-  $("me-ip").textContent = S.me.addr || "未获取到 IP";
+function setMyAddress(ips, port) {
+  S.ips = Array.isArray(ips) ? ips.filter(Boolean) : [];
+  if (port) S.port = port;
+  const p = S.port || 32200;
+  const list = S.ips.map((ip) => `${ip}:${p}`);
+  S.me.addr = list[0] || "";
+  $("me-ip").textContent = S.me.addr || "未获取到 IP（点右侧 ⓘ 查看）";
   $("empty-ip").textContent = S.me.addr || "—";
-  $("info-local").textContent = S.me.addr || "—";
+  $("info-local").textContent = list.length ? list.join("　") : "—";
 }
 
 async function copyMyAddress() {
   const a = S.me.addr || "";
-  if (!a) { toast("本机地址还没取到", true); return; }
+  if (!a) { toast("本机地址还没取到：确认引擎在运行", true); return; }
   try {
     await navigator.clipboard.writeText(a);
-    toast(`已复制 ${a}`);
+    toast(S.ips && S.ips.length > 1
+      ? `已复制 ${a}（共 ${S.ips.length} 个网卡地址，全部见右侧 ⓘ）`
+      : `已复制 ${a}`);
   } catch (_) { toast(`本机地址：${a}`); }
 }
 
@@ -711,14 +719,27 @@ function startChatWith(target) {
 /* ------------------------------- 引擎状态 ------------------------------- */
 
 async function startEngineAndRetry() {
-  $("start-server").textContent = "启动中…";
+  if (S.starting) return;
+  S.starting = true;
+  $("start-server").textContent = "正在启动引擎…";
   try {
     const r = await api("ensure_server", {});
-    if (r.running) { await boot(); return; }
-    toast(r.error || "启动失败", true);
-  } catch (e) { toast(e.message, true); }
-  $("start-server").textContent = "启动服务";
+    if (r.running) {
+      $("start-server").textContent = "启动服务";
+      S.starting = false;
+      await boot();
+      return;
+    }
+    toast(r.error || "引擎启动失败", true);
+    $("start-server").textContent = "重试启动";
+  } catch (e) {
+    toast(e.message, true);
+    $("start-server").textContent = "重试启动";
+  }
+  S.starting = false;
 }
+
+let autoStartTries = 0;
 
 async function boot() {
   let st = null;
@@ -727,21 +748,34 @@ async function boot() {
   } catch (e) {
     st = null;
   }
-  if (!st || !st.ping) {
+  const running = !!(st && st.running);
+  if (!running) {
     if (!S.active) $("offline").hidden = false;
+    // 引擎没跑：自动拉起（最多 3 次），不逼用户点按钮
+    if (!S.starting && autoStartTries < 3) {
+      autoStartTries += 1;
+      await startEngineAndRetry();
+    }
     return;
   }
+  autoStartTries = 0;
   $("offline").hidden = true;
+
   const ping = st.ping || {};
   S.me.name = ping.device || st.device_name || "?";
   S.me.id = ping.device_id || st.device_id || "";
   S.tls = !!st.tls;
-  S.port = ping.port || null;
   $("me-name").textContent = S.me.name;
   applyAvatar($("me-avatar"), S.me.id || S.me.name, S.me.name);
-  const ips = ping.ips || [];
-  setMyAddress(ips.length && S.port ? `${ips[0]}:${S.port}` : "");
-  $("foot-state").textContent = `v${ping.version || "?"} · ${S.tls ? "TLS 1.3" : "明文"} · 端口 ${S.port || "?"}`;
+
+  // 端口/IP 用回退链：ping 自报 → Rust 侧的 state/config 兜底
+  const port = ping.port || st.port || null;
+  const ips = (ping.ips && ping.ips.length ? ping.ips : (st.ips || []));
+  setMyAddress(ips, port);
+
+  $("foot-state").textContent =
+    `v${ping.version || "?"} · ${S.tls ? "TLS 1.3" : "明文"} · 端口 ${port || "?"}` +
+    (st.local_port ? ` · 界面口 ${st.local_port}` : "");
   $("info-tls").textContent = S.tls ? "TLS 1.3 已启用" : "明文（建议 tls on）";
 
   await refreshContacts();
